@@ -21,7 +21,7 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--exp-name", type=str, default=os.path.basename(__file__).rstrip(".py"),
         help="the name of this experiment")
-    parser.add_argument("--seed", type=int, default=np.random.randint(0,100),
+    parser.add_argument("--seed", type=int, default=21,
         help="seed of the experiment")
     parser.add_argument("--torch-deterministic", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
         help="if toggled, `torch.backends.cudnn.deterministic=False`")
@@ -65,6 +65,10 @@ def parse_args():
             help="Entropy regularization coefficient.")
     parser.add_argument("--autotune", type=lambda x:bool(strtobool(x)), default=True, nargs="?", const=True,
         help="automatic tuning of the entropy coefficient")
+    parser.add_argument("--lambda_reg", type=float, default=1, nargs="?", const=True,
+        help="coefficient weighting the lipshitz regularization terms")
+    parser.add_argument("--epsilon_reg", type=float, default=0.2, nargs="?", const=True,
+        help="noising the action to avoid zero gradient")
     args = parser.parse_args()
     # fmt: on
     return args
@@ -147,8 +151,10 @@ class Actor(nn.Module):
 
 if __name__ == "__main__":
     args = parse_args()
+    # run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
     args.seed=np.random.randint(0,100)
-    run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
+    run_name = f"{args.env_id}__{'lip_sac'}__{args.seed}__{int(time.time())}"
+
     if args.track:
         import wandb
 
@@ -251,11 +257,34 @@ if __name__ == "__main__":
                 min_qf_next_target = torch.min(qf1_next_target, qf2_next_target) - alpha * next_state_log_pi
                 next_q_value = data.rewards.flatten() + (1 - data.dones.flatten()) * args.gamma * (min_qf_next_target).view(-1)
 
+
             qf1_a_values = qf1(data.observations, data.actions).view(-1)
             qf2_a_values = qf2(data.observations, data.actions).view(-1)
             qf1_loss = F.mse_loss(qf1_a_values, next_q_value)
             qf2_loss = F.mse_loss(qf2_a_values, next_q_value)
-            qf_loss = qf1_loss + qf2_loss
+
+            # custom loss
+            a_0=data.actions+ args.epsilon_reg**2*torch.randn(data.actions.shape, device=device)
+            a_0.requires_grad=True
+            dir_a_mnl_1=F.mse_loss(qf1(data.observations, a_0),qf1(data.observations, data.actions))
+            dir_a_mnl_2=F.mse_loss(qf2(data.observations, a_0),qf2(data.observations, data.actions))
+            grads_1 = torch.autograd.grad(dir_a_mnl_1, a_0, create_graph=True)[0]
+            grads_2 = torch.autograd.grad(dir_a_mnl_2, a_0, create_graph=True)[0]
+            perturbation_1 = args.epsilon_reg*grads_1.data
+            perturbation_2 = args.epsilon_reg*grads_2.data
+            a_tilde_1=a_0+perturbation_1
+            a_tilde_2=a_0+perturbation_2
+            a_tilde_1=a_tilde_1.detach()
+            a_tilde_2=a_tilde_2.detach()
+            lipshitz_loss_1 = F.mse_loss(qf1(data.observations, a_tilde_1),qf1(data.observations, data.actions))
+            lipshitz_loss_2 = F.mse_loss(qf2(data.observations, a_tilde_2),qf1(data.observations, data.actions))
+
+            # print('liptshitz loss 1 : ', lipshitz_loss_1)
+            # print('qfi loss : ',qf1_loss)
+            # print('liptshitz loss 2 : ', lipshitz_loss_2)
+            # print('qf2 loss : ',qf2_loss)
+            qf_loss = qf1_loss + qf2_loss + args.lambda_reg * lipshitz_loss_1 +  args.lambda_reg * lipshitz_loss_2
+
 
             q_optimizer.zero_grad()
             qf_loss.backward()

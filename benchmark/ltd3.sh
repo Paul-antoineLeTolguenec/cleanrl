@@ -2,7 +2,7 @@ poetry install -E "mujoco_py pybullet"
 python -c "import mujoco_py"
 OMP_NUM_THREADS=1 xvfb-run -a python -m cleanrl_utils.benchmark \
     --env-ids Hopper-v3 \
-    --command "poetry run python cleanrl/td3_continuous_action.py --track --wandb-project-name cleanRL --seed 3" \
+    --command "poetry run python cleanrl/lipshitz_td3_continuous_action.py --track --capture-video --wandb-project-name cleanRL --seed 3" \
     --num-seeds 1 \
     --workers 1
 

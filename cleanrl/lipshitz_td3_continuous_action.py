@@ -1,4 +1,4 @@
-# docs and experiment results can be found at https://docs.cleanrl.dev/rl-algorithms/sac/#sac_continuous_actionpy
+# docs and experiment results can be found at https://docs.cleanrl.dev/rl-algorithms/td3/#td3_continuous_actionpy
 import argparse
 import os
 import random
@@ -21,7 +21,7 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--exp-name", type=str, default=os.path.basename(__file__).rstrip(".py"),
         help="the name of this experiment")
-    parser.add_argument("--seed", type=int, default=np.random.randint(0,100),
+    parser.add_argument("--seed", type=int, default=1,
         help="seed of the experiment")
     parser.add_argument("--torch-deterministic", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
         help="if toggled, `torch.backends.cudnn.deterministic=False`")
@@ -41,6 +41,8 @@ def parse_args():
         help="the id of the environment")
     parser.add_argument("--total-timesteps", type=int, default=1000000,
         help="total timesteps of the experiments")
+    parser.add_argument("--learning-rate", type=float, default=3e-4,
+        help="the learning rate of the optimizer")
     parser.add_argument("--buffer-size", type=int, default=int(1e6),
         help="the replay memory buffer size")
     parser.add_argument("--gamma", type=float, default=0.99,
@@ -49,22 +51,24 @@ def parse_args():
         help="target smoothing coefficient (default: 0.005)")
     parser.add_argument("--batch-size", type=int, default=256,
         help="the batch size of sample from the reply memory")
+    parser.add_argument("--policy-noise", type=float, default=0.2,
+        help="the scale of policy noise")
+    parser.add_argument("--exploration-noise", type=float, default=0.1,
+        help="the scale of exploration noise")
     parser.add_argument("--learning-starts", type=int, default=5e3,
         help="timestep to start learning")
-    parser.add_argument("--policy-lr", type=float, default=3e-4,
-        help="the learning rate of the policy network optimizer")
-    parser.add_argument("--q-lr", type=float, default=1e-3,
-        help="the learning rate of the Q network network optimizer")
     parser.add_argument("--policy-frequency", type=int, default=2,
         help="the frequency of training policy (delayed)")
     parser.add_argument("--target-network-frequency", type=int, default=1, # Denis Yarats' implementation delays this by 2.
         help="the frequency of updates for the target nerworks")
     parser.add_argument("--noise-clip", type=float, default=0.5,
         help="noise clip parameter of the Target Policy Smoothing Regularization")
-    parser.add_argument("--alpha", type=float, default=0.2,
-            help="Entropy regularization coefficient.")
-    parser.add_argument("--autotune", type=lambda x:bool(strtobool(x)), default=True, nargs="?", const=True,
-        help="automatic tuning of the entropy coefficient")
+    parser.add_argument("--lambda_reg", type=float, default=5, nargs="?", const=True,
+        help="coefficient weighting the lipshitz regularization terms")
+    parser.add_argument("--epsilon_reg", type=float, default=0.1, nargs="?", const=True,
+        help="noising the action to avoid zero gradient")
+    parser.add_argument("--nabl", type=int, default=1, nargs="?", const=True,
+        help="nb update actor because lipshitz")
     args = parser.parse_args()
     # fmt: on
     return args
@@ -86,7 +90,7 @@ def make_env(env_id, seed, idx, capture_video, run_name):
 
 
 # ALGO LOGIC: initialize agent here:
-class SoftQNetwork(nn.Module):
+class QNetwork(nn.Module):
     def __init__(self, env):
         super().__init__()
         self.fc1 = nn.Linear(np.array(env.single_observation_space.shape).prod() + np.prod(env.single_action_space.shape), 256)
@@ -101,17 +105,12 @@ class SoftQNetwork(nn.Module):
         return x
 
 
-LOG_STD_MAX = 2
-LOG_STD_MIN = -5
-
-
 class Actor(nn.Module):
     def __init__(self, env):
         super().__init__()
         self.fc1 = nn.Linear(np.array(env.single_observation_space.shape).prod(), 256)
         self.fc2 = nn.Linear(256, 256)
-        self.fc_mean = nn.Linear(256, np.prod(env.single_action_space.shape))
-        self.fc_logstd = nn.Linear(256, np.prod(env.single_action_space.shape))
+        self.fc_mu = nn.Linear(256, np.prod(env.single_action_space.shape))
         # action rescaling
         self.register_buffer(
             "action_scale", torch.tensor((env.action_space.high - env.action_space.low) / 2.0, dtype=torch.float32)
@@ -123,26 +122,8 @@ class Actor(nn.Module):
     def forward(self, x):
         x = F.relu(self.fc1(x))
         x = F.relu(self.fc2(x))
-        mean = self.fc_mean(x)
-        log_std = self.fc_logstd(x)
-        log_std = torch.tanh(log_std)
-        log_std = LOG_STD_MIN + 0.5 * (LOG_STD_MAX - LOG_STD_MIN) * (log_std + 1)  # From SpinUp / Denis Yarats
-
-        return mean, log_std
-
-    def get_action(self, x):
-        mean, log_std = self(x)
-        std = log_std.exp()
-        normal = torch.distributions.Normal(mean, std)
-        x_t = normal.rsample()  # for reparameterization trick (mean + std * N(0,1))
-        y_t = torch.tanh(x_t)
-        action = y_t * self.action_scale + self.action_bias
-        log_prob = normal.log_prob(x_t)
-        # Enforcing Action Bound
-        log_prob -= torch.log(self.action_scale * (1 - y_t.pow(2)) + 1e-6)
-        log_prob = log_prob.sum(1, keepdim=True)
-        mean = torch.tanh(mean) * self.action_scale + self.action_bias
-        return action, log_prob, mean
+        x = torch.tanh(self.fc_mu(x))
+        return x * self.action_scale + self.action_bias
 
 
 if __name__ == "__main__":
@@ -179,26 +160,17 @@ if __name__ == "__main__":
     envs = gym.vector.SyncVectorEnv([make_env(args.env_id, args.seed, 0, args.capture_video, run_name)])
     assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
 
-    max_action = float(envs.single_action_space.high[0])
-
     actor = Actor(envs).to(device)
-    qf1 = SoftQNetwork(envs).to(device)
-    qf2 = SoftQNetwork(envs).to(device)
-    qf1_target = SoftQNetwork(envs).to(device)
-    qf2_target = SoftQNetwork(envs).to(device)
+    qf1 = QNetwork(envs).to(device)
+    qf2 = QNetwork(envs).to(device)
+    qf1_target = QNetwork(envs).to(device)
+    qf2_target = QNetwork(envs).to(device)
+    target_actor = Actor(envs).to(device)
+    target_actor.load_state_dict(actor.state_dict())
     qf1_target.load_state_dict(qf1.state_dict())
     qf2_target.load_state_dict(qf2.state_dict())
-    q_optimizer = optim.Adam(list(qf1.parameters()) + list(qf2.parameters()), lr=args.q_lr)
-    actor_optimizer = optim.Adam(list(actor.parameters()), lr=args.policy_lr)
-
-    # Automatic entropy tuning
-    if args.autotune:
-        target_entropy = -torch.prod(torch.Tensor(envs.single_action_space.shape).to(device)).item()
-        log_alpha = torch.zeros(1, requires_grad=True, device=device)
-        alpha = log_alpha.exp().item()
-        a_optimizer = optim.Adam([log_alpha], lr=args.q_lr)
-    else:
-        alpha = args.alpha
+    q_optimizer = optim.Adam(list(qf1.parameters()) + list(qf2.parameters()), lr=args.learning_rate)
+    actor_optimizer = optim.Adam(list(actor.parameters()), lr=args.learning_rate)
 
     envs.single_observation_space.dtype = np.float32
     rb = ReplayBuffer(
@@ -217,8 +189,10 @@ if __name__ == "__main__":
         if global_step < args.learning_starts:
             actions = np.array([envs.single_action_space.sample() for _ in range(envs.num_envs)])
         else:
-            actions, _, _ = actor.get_action(torch.Tensor(obs).to(device))
-            actions = actions.detach().cpu().numpy()
+            with torch.no_grad():
+                actions = actor(torch.Tensor(obs).to(device))
+                actions += torch.normal(0, actor.action_scale * args.exploration_noise)
+                actions = actions.cpu().numpy().clip(envs.single_action_space.low, envs.single_action_space.high)
 
         # TRY NOT TO MODIFY: execute the game and log data.
         next_obs, rewards, dones, infos = envs.step(actions)
@@ -245,48 +219,63 @@ if __name__ == "__main__":
         if global_step > args.learning_starts:
             data = rb.sample(args.batch_size)
             with torch.no_grad():
-                next_state_actions, next_state_log_pi, _ = actor.get_action(data.next_observations)
+                clipped_noise = (torch.randn_like(data.actions, device=device) * args.policy_noise).clamp(
+                    -args.noise_clip, args.noise_clip
+                ) * target_actor.action_scale
+
+                next_state_actions = (target_actor(data.next_observations) + clipped_noise).clamp(
+                    envs.single_action_space.low[0], envs.single_action_space.high[0]
+                )
                 qf1_next_target = qf1_target(data.next_observations, next_state_actions)
                 qf2_next_target = qf2_target(data.next_observations, next_state_actions)
-                min_qf_next_target = torch.min(qf1_next_target, qf2_next_target) - alpha * next_state_log_pi
+                min_qf_next_target = torch.min(qf1_next_target, qf2_next_target)
                 next_q_value = data.rewards.flatten() + (1 - data.dones.flatten()) * args.gamma * (min_qf_next_target).view(-1)
 
             qf1_a_values = qf1(data.observations, data.actions).view(-1)
             qf2_a_values = qf2(data.observations, data.actions).view(-1)
             qf1_loss = F.mse_loss(qf1_a_values, next_q_value)
             qf2_loss = F.mse_loss(qf2_a_values, next_q_value)
-            qf_loss = qf1_loss + qf2_loss
+             # custom loss
+            a_0=data.actions+ args.epsilon_reg**2*torch.randn(data.actions.shape, device=device)
+            a_0.requires_grad=True
+            dir_a_mnl_1=F.mse_loss(qf1(data.observations, a_0),qf1(data.observations, data.actions))
+            dir_a_mnl_2=F.mse_loss(qf2(data.observations, a_0),qf2(data.observations, data.actions))
+            grads_1 = torch.autograd.grad(dir_a_mnl_1, a_0, create_graph=True)[0]
+            grads_2 = torch.autograd.grad(dir_a_mnl_2, a_0, create_graph=True)[0]
+            perturbation_1 = args.epsilon_reg*grads_1.data
+            perturbation_2 = args.epsilon_reg*grads_2.data
+            a_tilde_1=a_0+perturbation_1
+            a_tilde_2=a_0+perturbation_2
+            a_tilde_1=a_tilde_1.detach()
+            a_tilde_2=a_tilde_2.detach()
+            lipshitz_loss_1 = F.mse_loss(qf1(data.observations, a_tilde_1),qf1(data.observations, data.actions))
+            lipshitz_loss_2 = F.mse_loss(qf2(data.observations, a_tilde_2),qf1(data.observations, data.actions))
 
+            # print('liptshitz loss 1 : ', lipshitz_loss_1)
+            # print('qfi loss : ',qf1_loss)
+            # print('liptshitz loss 2 : ', lipshitz_loss_2)
+            # print('qf2 loss : ',qf2_loss)
+            qf_loss = qf1_loss + qf2_loss + args.lambda_reg * lipshitz_loss_1 +  args.lambda_reg * lipshitz_loss_2
+            # qf_loss = qf1_loss + qf2_loss
+
+            # optimize the model
             q_optimizer.zero_grad()
             qf_loss.backward()
             q_optimizer.step()
 
-            if global_step % args.policy_frequency == 0:  # TD 3 Delayed update support
+            if global_step % args.policy_frequency == 0:
                 for _ in range(
-                    args.policy_frequency
-                ):  # compensate for the delay by doing 'actor_update_interval' instead of 1
-                    pi, log_pi, _ = actor.get_action(data.observations)
-                    qf1_pi = qf1(data.observations, pi)
-                    qf2_pi = qf2(data.observations, pi)
-                    min_qf_pi = torch.min(qf1_pi, qf2_pi).view(-1)
-                    actor_loss = ((alpha * log_pi) - min_qf_pi).mean()
-
+                    args.policy_frequency*args.nabl
+                ):
+                    actor_loss = -qf1(data.observations, actor(data.observations)).mean()
                     actor_optimizer.zero_grad()
                     actor_loss.backward()
                     actor_optimizer.step()
 
-                    if args.autotune:
-                        with torch.no_grad():
-                            _, log_pi, _ = actor.get_action(data.observations)
-                        alpha_loss = (-log_alpha * (log_pi + target_entropy)).mean()
-
-                        a_optimizer.zero_grad()
-                        alpha_loss.backward()
-                        a_optimizer.step()
-                        alpha = log_alpha.exp().item()
-
-            # update the target networks
             if global_step % args.target_network_frequency == 0:
+                # update the target network
+                for param, target_param in zip(actor.parameters(), target_actor.parameters()):
+                    target_param.data.copy_(args.tau * param.data + (1 - args.tau) * target_param.data)
                 for param, target_param in zip(qf1.parameters(), qf1_target.parameters()):
                     target_param.data.copy_(args.tau * param.data + (1 - args.tau) * target_param.data)
                 for param, target_param in zip(qf2.parameters(), qf2_target.parameters()):
@@ -299,11 +288,8 @@ if __name__ == "__main__":
                 writer.add_scalar("losses/qf2_loss", qf2_loss.item(), global_step)
                 writer.add_scalar("losses/qf_loss", qf_loss.item() / 2.0, global_step)
                 writer.add_scalar("losses/actor_loss", actor_loss.item(), global_step)
-                writer.add_scalar("losses/alpha", alpha, global_step)
                 print("SPS:", int(global_step / (time.time() - start_time)))
                 writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
-                if args.autotune:
-                    writer.add_scalar("losses/alpha_loss", alpha_loss.item(), global_step)
 
     envs.close()
     writer.close()
