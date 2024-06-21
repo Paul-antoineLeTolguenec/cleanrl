@@ -28,10 +28,9 @@ CleanRL is a Deep Reinforcement Learning library that provides high-quality sing
 
 You can read more about CleanRL in our [JMLR paper](https://www.jmlr.org/papers/volume23/21-1342/21-1342.pdf) and [documentation](https://docs.cleanrl.dev/).
 
-CleanRL only contains implementations of **online** deep reinforcement learning algorithms. If you are looking for **offline** algorithms, please check out [tinkoff-ai/CORL](https://github.com/tinkoff-ai/CORL), which shares a similar design philosophy as CleanRL.
+CleanRL only contains implementations of **online** deep reinforcement learning algorithms. If you are looking for **offline** algorithms, please check out [corl-team/CORL](https://github.com/corl-team/CORL), which shares a similar design philosophy as CleanRL.
 
-> ℹ️ **Support for Gymnasium**: [Farama-Foundation/Gymnasium](https://github.com/Farama-Foundation/Gymnasium) is the next generation of [`openai/gym`](https://github.com/openai/gym) that will continue to be maintained and introduce new features. Please see their [announcement](https://farama.org/Announcing-The-Farama-Foundation) for further detail. We are migrating to `gymnasium` and the progress can be tracked in [vwxyzjn/cleanrl#277](https://github.com/vwxyzjn/cleanrl/pull/277).
-
+> ℹ️ **Support for Gymnasium**: [Farama-Foundation/Gymnasium](https://github.com/Farama-Foundation/Gymnasium) is the next generation of [`openai/gym`](https://github.com/openai/gym) that will continue to be maintained and introduce new features. Please see their [announcement](https://farama.org/Announcing-The-Farama-Foundation) for further detail. We are migrating to `gymnasium` and the progress can be tracked in [vwxyzjn/cleanrl#277](https://github.com/vwxyzjn/cleanrl/pull/277). 
 
 
 > ⚠️ **NOTE**: CleanRL is *not* a modular library and therefore it is not meant to be imported. At the cost of duplicate code, we make all implementation details of a DRL algorithm variant easy to understand, so CleanRL comes with its own pros and cons. You should consider using CleanRL if you want to 1) understand all implementation details of an algorithm's varaint or 2) prototype advanced features that other modular DRL libraries do not support (CleanRL has minimal lines of code so it gives you great debugging experience and you don't have do a lot of subclassing like sometimes in modular DRL libraries).
@@ -39,7 +38,7 @@ CleanRL only contains implementations of **online** deep reinforcement learning 
 ## Get started
 
 Prerequisites:
-* Python >=3.7.1,<3.10 (not yet 3.10)
+* Python >=3.7.1,<3.11
 * [Poetry 1.2.1+](https://python-poetry.org)
 
 To run experiments locally, give the following a try:
@@ -55,7 +54,7 @@ poetry run python cleanrl/ppo.py \
     --env-id CartPole-v0 \
     --total-timesteps 50000
 
-# open another temrminal and enter `cd cleanrl/cleanrl`
+# open another terminal and enter `cd cleanrl/cleanrl`
 tensorboard --logdir runs
 ```
 
@@ -78,10 +77,8 @@ pip install -r requirements/requirements.txt
 
 # optional dependencies
 pip install -r requirements/requirements-atari.txt
-pip install -r requirements/requirements-pybullet.txt
 pip install -r requirements/requirements-mujoco.txt
 pip install -r requirements/requirements-mujoco_py.txt
-pip install -r requirements/requirements-mujoco.txt
 pip install -r requirements/requirements-procgen.txt
 pip install -r requirements/requirements-envpool.txt
 pip install -r requirements/requirements-pettingzoo.txt
@@ -112,12 +109,6 @@ python cleanrl/ppo_atari_envpool.py --env-id BreakoutNoFrameskip-v4
 # Learn Pong-v5 in ~5-10 mins
 # Side effects such as lower sample efficiency might occur
 poetry run python ppo_atari_envpool.py --clip-coef=0.2 --num-envs=16 --num-minibatches=8 --num-steps=128 --update-epochs=3
-
-# pybullet
-poetry install -E pybullet
-python cleanrl/td3_continuous_action.py --env-id MinitaurBulletDuckEnv-v0
-python cleanrl/ddpg_continuous_action.py --env-id MinitaurBulletDuckEnv-v0
-python cleanrl/sac_continuous_action.py --env-id MinitaurBulletDuckEnv-v0
 
 # procgen
 poetry install -E procgen
@@ -165,6 +156,8 @@ You may also use a prebuilt development environment hosted in Gitpod:
 |  | [`td3_continuous_action_jax.py`](https://github.com/vwxyzjn/cleanrl/blob/master/cleanrl/td3_continuous_action_jax.py),  [docs](https://docs.cleanrl.dev/rl-algorithms/td3/#td3_continuous_action_jaxpy) |
 | ✅ [Phasic Policy Gradient (PPG)](https://arxiv.org/abs/2009.04416) |  [`ppg_procgen.py`](https://github.com/vwxyzjn/cleanrl/blob/master/cleanrl/ppg_procgen.py),  [docs](https://docs.cleanrl.dev/rl-algorithms/ppg/#ppg_procgenpy) |
 | ✅ [Random Network Distillation (RND)](https://arxiv.org/abs/1810.12894) |  [`ppo_rnd_envpool.py`](https://github.com/vwxyzjn/cleanrl/blob/master/cleanrl/ppo_rnd_envpool.py),  [docs](/rl-algorithms/ppo-rnd/#ppo_rnd_envpoolpy) |
+| ✅ [Qdagger](https://arxiv.org/abs/2206.01626)  |  [`qdagger_dqn_atari_impalacnn.py`](https://github.com/vwxyzjn/cleanrl/blob/master/cleanrl/qdagger_dqn_atari_impalacnn.py),  [docs](https://docs.cleanrl.dev/rl-algorithms/qdagger/#qdagger_dqn_atari_impalacnnpy) |
+|  | [`qdagger_dqn_atari_jax_impalacnn.py`](https://github.com/vwxyzjn/cleanrl/blob/master/cleanrl/qdagger_dqn_atari_jax_impalacnn.py), [docs](https://docs.cleanrl.dev/rl-algorithms/qdagger/#qdagger_dqn_atari_jax_impalacnnpy) |
 
 
 ## Open RL Benchmark
@@ -198,3 +191,12 @@ If you use CleanRL in your work, please cite our technical [paper](https://www.j
   url     = {http://jmlr.org/papers/v23/21-1342.html}
 }
 ```
+
+
+## Acknowledgement
+
+CleanRL is a community-powered by project and our contributors run experiments on a variety of hardware.
+
+* We thank many contributors for using their own computers to run experiments
+* We thank Google's [TPU research cloud](https://sites.research.google/trc/about/) for providing TPU resources.
+* We thank [Hugging Face](https://huggingface.co/)'s cluster for providing GPU resources. 

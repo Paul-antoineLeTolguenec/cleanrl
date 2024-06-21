@@ -44,6 +44,15 @@ the CleanRL script under the poetry virtual environments.
     **We will assume to run other commands (e.g. `tensorboard`) in the documentation within the poetry's shell.**
 
 
+!!! note 
+Currently, `ddpg_continuous_action_jax.py`, `ddpg_continuous_action.py` have been ported to gymnasium. 
+
+Please note that, `stable-baselines3` version `1.2` does not support `gymnasium`. To use these scripts, please install the `alpha1` version like, 
+
+```
+poetry run pip install sb3==2.0.0a1
+```
+
 !!! warning
 
     If you are using NVIDIA ampere GPUs (e.g., 3060 TI), you might meet the following error
@@ -66,7 +75,7 @@ the CleanRL script under the poetry virtual environments.
 
     This is because the `torch` wheel on PyPi is built with cuda 10.2. You would need to manually install the cuda 11.3 wheel like this:
     ```bash
-    poetry run pip install torch --upgrade --extra-index-url https://download.pytorch.org/whl/cu113
+    poetry run pip install torch==1.12.1 --upgrade --extra-index-url https://download.pytorch.org/whl/cu113
     ```
     Then, you can run the script again.
 
@@ -84,7 +93,7 @@ tensorboard --logdir runs
 
 ## Visualize the Agent's Gameplay Videos
 
-CleanRL helps record the agent's gameplay videos with a `--capture-video` flag,
+CleanRL helps record the agent's gameplay videos with a `--capture_video` flag,
 which will save the videos in the `videos/{$run_name}` folder.
 
 ```bash linenums="1" hl_lines="5"
@@ -92,7 +101,7 @@ python cleanrl/ppo.py \
     --seed 1 \
     --env-id CartPole-v0 \
     --total-timesteps 50000 \
-    --capture-video
+    --capture_video
 ```
 
 ![videos](videos.png)
@@ -110,7 +119,7 @@ usage: ppo.py [-h] [--exp-name EXP_NAME] [--env-id ENV_ID]
               [--total-timesteps TOTAL_TIMESTEPS]
               [--torch-deterministic [TORCH_DETERMINISTIC]] [--cuda [CUDA]]
               [--track [TRACK]] [--wandb-project-name WANDB_PROJECT_NAME]
-              [--wandb-entity WANDB_ENTITY] [--capture-video [CAPTURE_VIDEO]]
+              [--wandb-entity WANDB_ENTITY] [--capture_video [CAPTURE_VIDEO]]
               [--num-envs NUM_ENVS] [--num-steps NUM_STEPS]
               [--anneal-lr [ANNEAL_LR]] [--gae [GAE]] [--gamma GAMMA]
               [--gae-lambda GAE_LAMBDA] [--num-minibatches NUM_MINIBATCHES]
@@ -137,7 +146,7 @@ optional arguments:
                         the wandb's project name
   --wandb-entity WANDB_ENTITY
                         the entity (team) of wandb's project
-  --capture-video [CAPTURE_VIDEO]
+  --capture_video [CAPTURE_VIDEO]
                         weather to capture videos of the agent performances (check
                         out `videos` folder)
   --num-envs NUM_ENVS   the number of parallel game environments
