@@ -25,7 +25,7 @@ class Args:
     """if toggled, `torch.backends.cudnn.deterministic=False`"""
     cuda: bool = True
     """if toggled, cuda will be enabled by default"""
-    track: bool = False
+    track: bool = True
     """if toggled, this experiment will be tracked with Weights and Biases"""
     wandb_project_name: str = "cleanRLTest"
     """the wandb's project name"""
@@ -71,7 +71,7 @@ class Args:
     """the frequency of training"""
     tau_soft : float = 0.03
     """the temperature parameter for the soft-max policy"""
-    alpha : float = 0.9
+    alpha : float = 10 #0.9
     """the entropy regularization parameter"""
     l_0 : float = -1.0
     """the lower bound of the weighted log probability"""
@@ -80,10 +80,12 @@ class Args:
     # TRANSFORMER SPECIFIC
     num_heads: int = 4
     """the number of attention heads"""
-    attention_dim: int = 16
+    attention_dim: int = 4
     """the dimension of the attention layer"""
     sequence_length: int = 4
     """the length of the sequence"""
+    representation_dim: int = 32
+    """the dimension of the representation layer"""
 
 
 
@@ -145,11 +147,12 @@ class MultiHeadAttention(nn.Module):
 
 # ALGO LOGIC: initialize agent here:
 class QNetwork(nn.Module):
-    def __init__(self, env, num_heads, attention_dim, sequence_length):
+    def __init__(self, env, num_heads, attention_dim, sequence_length, representation_dim=32):
         super().__init__()
-        self.mutli_head_attention = MultiHeadAttention(np.array(env.single_observation_space.shape).prod()-2, num_heads, attention_dim)
+        self.mutli_head_attention = MultiHeadAttention(np.array(env.single_observation_space.shape).prod(), num_heads, attention_dim)
+        self.layer_representation = nn.Linear(sequence_length*(np.array(env.single_observation_space.shape).prod()), representation_dim)
         self.network = nn.Sequential(
-            nn.Linear(sequence_length*(np.array(env.single_observation_space.shape).prod()-2), 32),
+            nn.Linear(representation_dim, 32),
             nn.ReLU(),
             nn.Linear(32, 16),
             nn.ReLU(),
@@ -159,8 +162,14 @@ class QNetwork(nn.Module):
     def forward(self, x):
         x, _ = self.mutli_head_attention(x)
         x = x.view(x.size(0), -1)
+        x = self.layer_representation(x)
         return self.network(x)
 
+    def representation(self, x):
+        x, _ = self.mutli_head_attention(x)
+        x = x.view(x.size(0), -1)
+        x =self.layer_representation(x)
+        return x
 
 def linear_schedule(start_e: float, end_e: float, duration: int, t: int):
     slope = (end_e - start_e) / duration
@@ -227,39 +236,44 @@ poetry run pip install "stable_baselines3==2.0.0a1"
     optimizer = optim.Adam(q_network.parameters(), lr=args.learning_rate)
     target_network = QNetwork(envs, num_heads=args.num_heads, attention_dim=args.attention_dim, sequence_length=args.sequence_length).to(device)
     target_network.load_state_dict(q_network.state_dict())
-
+    P_FORWARD = torch.nn.Parameter(torch.rand(args.representation_dim, args.representation_dim), requires_grad=True)
     rb = ReplayBuffer(
         args.buffer_size,
-        envs.single_observation_space if args.env_id != "CartPole-v1" else gym.spaces.Box(
-            low=-np.inf, high=np.inf, shape=(2,), dtype=np.float32
-        ),
+        envs.single_observation_space, #if args.env_id != "CartPole-v1" else gym.spaces.Box(
+        #     low=-np.inf, high=np.inf, shape=(2,), dtype=np.float32
+        # ),
         envs.single_action_space,
         device,
         handle_timeout_termination=False,
     )
     start_time = time.time()
-    state = np.zeros((args.num_envs, args.sequence_length, *envs.single_observation_space.shape)) if args.env_id != "CartPole-v1" else np.zeros((args.num_envs, args.sequence_length, 2))
+    state = np.zeros((args.num_envs, args.sequence_length, *envs.single_observation_space.shape)) #if args.env_id != "CartPole-v1" else np.zeros((args.num_envs, args.sequence_length, 2))
     # TRY NOT TO MODIFY: start the game
     obs, _ = envs.reset(seed=args.seed)
-    if args.env_id == "CartPole-v1":
+    # if args.env_id == "CartPole-v1":
         # remove obs[1] and obs[3] from the observation space
-        obs = obs[:, [0, 2]]
+        # obs = obs[:, [0, 2]]
     state[:, -1] = obs
     for global_step in range(args.total_timesteps):
         # ALGO LOGIC: put action logic here
         # softmax policy
         with torch.no_grad():
             q_values = q_network(torch.Tensor(state).to(device))
+            # print('q_values', q_values) if global_step > args.learning_starts else None
             policy = soft_max(q_values, args.tau_soft)
+            # print('policy', policy) if global_step > args.learning_starts else None
             actions = torch.multinomial(policy, 1).squeeze(-1).cpu().numpy()
         # TRY NOT TO MODIFY: execute the game and log data.
         next_obs, rewards, terminations, truncations, infos = envs.step(actions)
-        if args.env_id == "CartPole-v1":
+        # if args.env_id == "CartPole-v1":
             # remove obs[1] and obs[3] from the observation space
-            next_obs = next_obs[:, [0, 2]]
+            # next_obs = next_obs[:, [0, 2]]
         # update state
         state = np.roll(state, shift=-1, axis=1)
         state[:, -1] = next_obs
+        # print('state', state) if global_step > args.learning_starts else None
+        # input('press') if global_step > args.learning_starts else None
+
         # TRY NOT TO MODIFY: record rewards for plotting purposes
         if "final_info" in infos:
             for info in infos["final_info"]:
@@ -282,20 +296,32 @@ poetry run pip install "stable_baselines3==2.0.0a1"
         if global_step > args.learning_starts:
             if global_step % args.train_frequency == 0:
                 # custom sampling 
-                batch_inds = np.random.randint(0, rb.pos, args.batch_size)
-                
+                batch_inds = np.random.randint(args.sequence_length, rb.pos if not rb.full else args.buffer_size, size=args.batch_size)
+                batch_state = torch.tensor(np.concatenate([rb.observations[batch_inds-i] for i in range(args.sequence_length, 0, -1)], axis=1)).to(device)
+                batch_next_state = torch.tensor(np.concatenate([rb.next_observations[batch_inds-i] for i in range(args.sequence_length, 0, -1)], axis=1)).to(device)
+                batch_rewards = torch.tensor(rb.rewards[batch_inds]).to(device)
+                batch_actions = torch.tensor(rb.actions[batch_inds]).squeeze(-1).to(device)
+                batch_dones = torch.tensor(rb.dones[batch_inds]).to(device)
                 with torch.no_grad():
-                    target_q_values = target_network(data.next_observations)
+                    # Q-Learning with Munchausen RL
+                    target_q_values = target_network(batch_next_state)
                     target_policy = soft_max(target_q_values, args.tau_soft)
-                    target_next_q_values = target_network(data.next_observations)
+                    target_next_q_values = target_network(batch_next_state)
                     target_next_policy = soft_max(target_next_q_values, args.tau_soft)
-                    red_term = args.alpha*(args.tau_soft*torch.log(target_policy.gather(1, data.actions))+args.epsilon_tar).clamp(args.l_0, 0.0)
+                    red_term = args.alpha*(args.tau_soft*torch.log(target_policy.gather(1, batch_actions))+args.epsilon_tar).clamp(args.l_0, 0.0)
                     bleu_term = -args.tau_soft * torch.log(target_next_policy+args.epsilon_tar)
-                    munchausen_target = data.rewards + red_term + \
-                                        args.gamma * (1 - data.dones) * (target_next_policy * (target_next_q_values + bleu_term)).sum(dim=-1).unsqueeze(-1)
+                    munchausen_target = batch_rewards + red_term + \
+                                        args.gamma * (1 - batch_dones) * (target_next_policy * (target_next_q_values + bleu_term)).sum(dim=-1).unsqueeze(-1)
                     td_target = munchausen_target.squeeze()
-                old_val = q_network(data.observations).gather(1, data.actions).squeeze()
+                old_val = q_network(batch_state).gather(1, batch_actions).squeeze()
                 loss = F.mse_loss(td_target, old_val)
+                # Representation Learning
+                representation = q_network.representation(batch_state)
+                representation_next = q_network.representation(batch_next_state).detach()
+                # loss 
+                representation_loss = F.mse_loss(representation_next, torch.matmul(representation, P_FORWARD))
+                loss += representation_loss
+                
 
                 if global_step % 100 == 0:
                     writer.add_scalar("losses/td_loss", loss, global_step)
@@ -303,6 +329,9 @@ poetry run pip install "stable_baselines3==2.0.0a1"
                     writer.add_scalar("losses/td_target", td_target.mean().item(), global_step)
                     writer.add_scalar("losses/log_policy", red_term.mean().item(), global_step)
                     writer.add_scalar("losses/entropy", bleu_term.mean().item(), global_step)
+                    writer.add_scalar("losses/munchausen_target", munchausen_target.mean().item(), global_step)
+                    writer.add_scalar("losses/representation_loss", representation_loss, global_step)
+
                     print("SPS:", int(global_step / (time.time() - start_time)))
                     writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
 
