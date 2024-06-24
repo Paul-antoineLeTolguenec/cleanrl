@@ -5,6 +5,7 @@ import time
 from dataclasses import dataclass
 
 import gymnasium as gym
+from gymnasium.spaces import Discrete, Box
 import numpy as np
 import torch
 import torch.nn as nn
@@ -14,6 +15,7 @@ import tyro
 from stable_baselines3.common.buffers import ReplayBuffer
 from torch.utils.tensorboard import SummaryWriter
 from stable_baselines3.common.type_aliases import ReplayBufferSamples
+from torch.distributions.kl import kl_divergence
 
 
 @dataclass
@@ -46,7 +48,7 @@ class Args:
     """the id of the environment"""
     total_timesteps: int = 500000
     """total timesteps of the experiments"""
-    learning_rate: float = 5e-4
+    learning_rate: float = 2.5e-4
     """the learning rate of the optimizer"""
     num_envs: int = 1
     """the number of parallel game environments"""
@@ -54,7 +56,7 @@ class Args:
     """the replay memory buffer size"""
     gamma: float = 0.99
     """the discount factor gamma"""
-    tau: float = 0.05 #1.0
+    tau: float = 0.01 #1.0
     """the target network update rate"""
     target_network_frequency: int = 10 #500
     """the timesteps it takes to update the target network"""
@@ -70,7 +72,7 @@ class Args:
     """timestep to start learning"""
     train_frequency: int = 10
     """the frequency of training"""
-    tau_soft : float = 0.2 #0.03 original implem
+    tau_soft : float = 0.5 #0.03 original implem
     """the temperature parameter for the soft-max policy"""
     alpha : float = 0.9 #0.9
     """the entropy regularization parameter"""
@@ -79,18 +81,18 @@ class Args:
     epsilon_tar : float = 1e-6
     """the epsilon term for numerical stability"""
     # TRANSFORMER SPECIFIC
-    num_heads: int = 2
+    num_heads: int = 4
     """the number of attention heads"""
-    attention_dim: int = 4
+    attention_dim: int = 8
     """the dimension of the attention layer"""
-    sequence_length: int = 4
+    sequence_length: int = 2
     """the length of the sequence"""
-    representation_dim: int = 32
+    representation_dim: int = 4
     """the dimension of the representation layer"""
-    tau_transformer : float = 10.0
-    """the temperature parameter for the transformer"""
-    lambda_r : float = 0.1
-    """the weight of the representation loss"""
+    lambda_forward : float = 0.2
+    """the weight of the forward loss"""
+    lambda_backward : float = 0.2
+    """the weight of the backward loss"""
 
 
 
@@ -154,8 +156,8 @@ class MultiHeadAttention(nn.Module):
 class QNetwork(nn.Module):
     def __init__(self, env, num_heads, attention_dim, sequence_length, representation_dim=32):
         super().__init__()
-        self.mutli_head_attention = MultiHeadAttention(np.array(env.single_observation_space.shape).prod(), num_heads, attention_dim)
-        self.layer_representation = nn.Linear(sequence_length*(np.array(env.single_observation_space.shape).prod()), representation_dim)
+        self.mutli_head_attention = MultiHeadAttention(np.array(env.single_observation_space.shape).prod()-1, num_heads, attention_dim)
+        self.layer_representation = nn.Linear(sequence_length*(np.array(env.single_observation_space.shape).prod()-1), representation_dim)
         self.network = nn.Sequential(
             nn.Linear(representation_dim, 32),
             nn.ReLU(),
@@ -165,7 +167,7 @@ class QNetwork(nn.Module):
         )
 
     def forward(self, x):
-        x = self.representation(x)
+        x= self.representation(x)
         # print('representation', x)
         # input('press')
         return self.network(x)
@@ -173,9 +175,8 @@ class QNetwork(nn.Module):
     def representation(self, x):
         x, _ = self.mutli_head_attention(x)
         x = x.view(x.size(0), -1)
-        x =self.layer_representation(x)
-        return x
-
+        return self.layer_representation(x)
+    
 def linear_schedule(start_e: float, end_e: float, duration: int, t: int):
     slope = (end_e - start_e) / duration
     return max(slope * t + start_e, end_e)
@@ -184,12 +185,6 @@ def soft_max(q_values, tau):
     return F.softmax(q_values / tau, dim=-1)
 
 
-def wrap_cartpole(env):
-    # remove obs[1] and obs[3] from the observation space
-    env.observation_space = gym.spaces.Box(
-        low=-np.inf, high=np.inf, shape=(2,), dtype=np.float32
-    )
-    return env
 
 # def _get_samples(batch_inds, rb, env = None):
 #     # Sample randomly the env idx
@@ -254,54 +249,39 @@ poetry run pip install "stable_baselines3==2.0.0a1"
     )
     assert isinstance(envs.single_action_space, gym.spaces.Discrete), "only discrete action space is supported"
     # bypass the attention_dim and sequence_length
-    args.attention_dim = envs.single_observation_space.shape[0] 
-    q_network = QNetwork(envs, num_heads=args.num_heads, attention_dim=args.attention_dim, sequence_length=args.sequence_length).to(device)
+    # args.attention_dim = envs.single_observation_space.shape[0] - 2 
+    q_network = QNetwork(envs, num_heads=args.num_heads, attention_dim=args.attention_dim, sequence_length=args.sequence_length, representation_dim=args.representation_dim).to(device)
     optimizer = optim.Adam(q_network.parameters(), lr=args.learning_rate)
-    target_network = QNetwork(envs, num_heads=args.num_heads, attention_dim=args.attention_dim, sequence_length=args.sequence_length).to(device)
+    target_network = QNetwork(envs, num_heads=args.num_heads, attention_dim=args.attention_dim, sequence_length=args.sequence_length,representation_dim=args.representation_dim).to(device)
     target_network.load_state_dict(q_network.state_dict())
-    P_FORWARD = torch.nn.Parameter(torch.rand(args.representation_dim, args.representation_dim), requires_grad=True).to(device)
+    action_dim = 1 if isinstance(envs.single_action_space, Discrete) else envs.single_action_space.shape[0]
+    P_FORWARD = torch.nn.Parameter(torch.rand(args.representation_dim, args.representation_dim + action_dim), requires_grad=True).to(device)
+    P_BACKWARD = torch.nn.Parameter(torch.rand(action_dim, args.representation_dim*2), requires_grad=True).to(device)
     rb = ReplayBuffer(
         args.buffer_size,
-        envs.single_observation_space, #if args.env_id != "CartPole-v1" else gym.spaces.Box(
-        #     low=-np.inf, high=np.inf, shape=(2,), dtype=np.float32
-        # ),
+        gym.spaces.Box(low=-np.inf, high=np.inf, shape=(args.sequence_length, *envs.single_observation_space.shape), dtype=np.float32),
         envs.single_action_space,
         device,
         handle_timeout_termination=False,
     )
     start_time = time.time()
-    state = np.zeros((args.num_envs, args.sequence_length, *envs.single_observation_space.shape)) #if args.env_id != "CartPole-v1" else np.zeros((args.num_envs, args.sequence_length, 2))
+    state = np.zeros((args.num_envs, args.sequence_length, *envs.single_observation_space.shape)) 
     # TRY NOT TO MODIFY: start the game
     obs, _ = envs.reset(seed=args.seed)
-    # if args.env_id == "CartPole-v1":
-        # remove obs[1] and obs[3] from the observation space
-        # obs = obs[:, [0, 2]]
     state[:, -1] = obs
     for global_step in range(args.total_timesteps):
         # ALGO LOGIC: put action logic here
         # softmax policy
         with torch.no_grad():
-            # print('state', state)
-            q_values = q_network(torch.Tensor(state).to(device))
-            # print('q_values', q_values)
+            q_values = q_network(torch.Tensor(state[:,:, [0,2,3]]).to(device))
+            # q_values = q_network(torch.tensor(state, dtype=torch.float32).to(device))
             # print('q_values', q_values) if global_step > args.learning_starts else None
             policy = soft_max(q_values, args.tau_soft)
-            # print('policy', policy)
-            # input('press')
             # print('policy', policy) if global_step > args.learning_starts else None
+            # input('press') if global_step > args.learning_starts else None
             actions = torch.multinomial(policy, 1).squeeze(-1).cpu().numpy()
         # TRY NOT TO MODIFY: execute the game and log data.
         next_obs, rewards, terminations, truncations, infos = envs.step(actions)
-        # if args.env_id == "CartPole-v1":
-            # remove obs[1] and obs[3] from the observation space
-            # next_obs = next_obs[:, [0, 2]]
-        # update state
-        state = np.roll(state, shift=-1, axis=1)
-        state[:, -1] = next_obs.copy()
-        # print('next_obs', next_obs)
-        # print('state', state)
-        # print('state', state) if global_step > args.learning_starts else None
-        # input('press') if global_step > args.learning_starts else None
 
         # TRY NOT TO MODIFY: record rewards for plotting purposes
         if "final_info" in infos:
@@ -314,30 +294,36 @@ poetry run pip install "stable_baselines3==2.0.0a1"
 
         # TRY NOT TO MODIFY: save data to reply buffer; handle `final_observation`
         real_next_obs = next_obs.copy()
+        # update state
+        next_state = np.roll(state, shift=-1, axis=1)
+        next_state[:, -1] = next_obs.copy()
+        
         for idx, trunc in enumerate(truncations):
             if trunc:
                 real_next_obs[idx] = infos["final_observation"][idx]
             if terminations[idx]:
                 # reset state
-                state[idx] = np.zeros((args.sequence_length, *envs.single_observation_space.shape)) #if args.env_id != "CartPole-v1" else np.zeros((args.sequence_length, 2))
-                state[idx, -1] = real_next_obs[idx]
-        rb.add(obs, real_next_obs, actions, rewards, terminations, infos)
+                next_state[idx] = np.zeros((args.sequence_length, *envs.single_observation_space.shape)) 
+                next_state[idx, -1] = real_next_obs[idx].copy() 
+        rb.add(state, next_state, actions, rewards, terminations, infos)
 
         # TRY NOT TO MODIFY: CRUCIAL step easy to overlook
         obs = next_obs
+        state = next_state
 
         # ALGO LOGIC: training.
         if global_step > args.learning_starts:
             if global_step % args.train_frequency == 0:
                 # custom sampling 
                 batch_inds = np.random.randint(args.sequence_length, rb.pos, args.batch_size) if not rb.full else (np.random.randint(1+args.sequence_length, rb.buffer_size, size=args.batch_size) + rb.pos) % rb.buffer_size
-                batch_state = torch.tensor(np.concatenate([rb.observations[batch_inds-i] for i in range(args.sequence_length-1, -1, -1)], axis=1)).to(device)
-                batch_next_state = torch.tensor(np.concatenate([rb.next_observations[batch_inds-i] for i in range(args.sequence_length-1, -1, -1)], axis=1)).to(device)
+                batch_state = torch.tensor(rb.observations[batch_inds]).squeeze(1).to(device)
+                last_obs = batch_state[:,-1]
+                batch_state = batch_state[:,:, [0,2,3]]
+                batch_next_state = torch.tensor(rb.next_observations[batch_inds]).squeeze(1).to(device)
+                batch_next_state = batch_next_state[:,:, [0,2,3]]
                 batch_rewards = torch.tensor(rb.rewards[batch_inds]).to(device)
                 batch_actions = torch.tensor(rb.actions[batch_inds]).squeeze(-1).to(device)
-                batch_dones = torch.tensor(np.concatenate([rb.dones[batch_inds-i] for i in range(args.sequence_length-1, -1, -1)], axis=1)).to(device)
-                # mask dones (check if any done in sequence)
-                batch_dones = (batch_dones.sum(dim=1) > 0).float().unsqueeze(-1)
+                batch_dones = torch.tensor(rb.dones[batch_inds]).to(device)
                 with torch.no_grad():
                     # Q-Learning with Munchausen RL
                     target_q_values = target_network(batch_next_state)
@@ -352,11 +338,17 @@ poetry run pip install "stable_baselines3==2.0.0a1"
                 old_val = q_network(batch_state).gather(1, batch_actions).squeeze()
                 loss = F.mse_loss(td_target, old_val)
                 # Representation Learning
-                representation = q_network.representation(batch_state)
-                representation_next = q_network.representation(batch_next_state).detach()
-                # loss 
-                representation_loss = F.mse_loss(representation_next, torch.matmul(representation, P_FORWARD))
-                loss += args.lambda_r*representation_loss
+                r_s= q_network.representation(batch_state)
+                r_ns_hat_a = torch.cat([r_s, batch_actions.float()], dim=1)
+                r_ns_hat = torch.mm(r_ns_hat_a, P_FORWARD.t())
+                # with torch.no_grad():
+                r_ns= q_network.representation(batch_next_state)
+                action_hat = torch.mm(torch.cat([r_s, r_ns], dim=1), P_BACKWARD.t())
+                backward_loss = F.mse_loss(action_hat, batch_actions.float())
+                forward_loss = F.mse_loss(r_ns_hat, r_ns)
+                sheet_loss = F.mse_loss(r_s, last_obs)
+                loss += args.lambda_forward*forward_loss + args.lambda_backward * backward_loss
+                # loss += args.lambda_r*sheet_loss
                 
 
                 if global_step % 100 == 0:
@@ -366,8 +358,10 @@ poetry run pip install "stable_baselines3==2.0.0a1"
                     writer.add_scalar("losses/log_policy", red_term.mean().item(), global_step)
                     writer.add_scalar("losses/entropy", bleu_term.mean().item(), global_step)
                     writer.add_scalar("losses/munchausen_target", munchausen_target.mean().item(), global_step)
-                    writer.add_scalar("losses/representation_loss", representation_loss, global_step)
-
+                    writer.add_scalar("losses/forward_loss", forward_loss, global_step)
+                    writer.add_scalar("losses/backward_loss", backward_loss, global_step)
+                    writer.add_scalar("losses/sheet_loss", sheet_loss, global_step)
+                    # print('representation_loss', representation_loss)
                     print("SPS:", int(global_step / (time.time() - start_time)))
                     writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
 
