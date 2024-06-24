@@ -48,7 +48,7 @@ class Args:
     """the id of the environment"""
     total_timesteps: int = 500000
     """total timesteps of the experiments"""
-    learning_rate: float = 2.5e-4
+    learning_rate: float = 5e-4
     """the learning rate of the optimizer"""
     num_envs: int = 1
     """the number of parallel game environments"""
@@ -83,16 +83,20 @@ class Args:
     # TRANSFORMER SPECIFIC
     num_heads: int = 4
     """the number of attention heads"""
-    attention_dim: int = 8
+    attention_dim: int = 16
     """the dimension of the attention layer"""
     sequence_length: int = 2
     """the length of the sequence"""
     representation_dim: int = 4
     """the dimension of the representation layer"""
-    lambda_forward : float = 0.2
+    lambda_forward : float = 0.5
     """the weight of the forward loss"""
-    lambda_backward : float = 0.2
+    lambda_backward : float = 0.5
     """the weight of the backward loss"""
+    lambda_td : float = 1.0
+    """the weight of the td loss"""
+    lr_representation : float = 2.5e-4
+    """the learning rate of the representation network"""
 
 
 
@@ -151,13 +155,32 @@ class MultiHeadAttention(nn.Module):
 
         return output, attention_weights
 
+class RPNetwork(nn.Module):
+    def __init__(self, env, num_heads, attention_dim, sequence_length, representation_dim):
+        super(RPNetwork, self).__init__()
+        self.mutli_head_attention = MultiHeadAttention(np.array(env.single_observation_space.shape).prod()-1, num_heads, attention_dim)
+        self.layer_representation = nn.Linear(sequence_length*(np.array(env.single_observation_space.shape).prod()-1), representation_dim)
+        action_dim = 1 if isinstance(env.single_action_space, Discrete) else env.single_action_space.shape[0]
+        self.predictive_layer = nn.Linear(representation_dim + action_dim,representation_dim)
+        self.inverse_layer = nn.Linear(representation_dim*2, action_dim)
+
+    def forward(self, x):
+        x, _ = self.mutli_head_attention(x)
+        x = x.view(x.size(0), -1)
+        return self.layer_representation(x)
+    
+    def forward_predict(self, x, a):
+        x = torch.cat([x, a], dim=1)
+        return self.predictive_layer(x)
+    
+    def forward_inverse(self, x, x_prime):
+        x = torch.cat([x, x_prime], dim=1)
+        return self.inverse_layer(x)
 
 # ALGO LOGIC: initialize agent here:
 class QNetwork(nn.Module):
-    def __init__(self, env, num_heads, attention_dim, sequence_length, representation_dim=32):
+    def __init__(self, env, representation_dim):
         super().__init__()
-        self.mutli_head_attention = MultiHeadAttention(np.array(env.single_observation_space.shape).prod()-1, num_heads, attention_dim)
-        self.layer_representation = nn.Linear(sequence_length*(np.array(env.single_observation_space.shape).prod()-1), representation_dim)
         self.network = nn.Sequential(
             nn.Linear(representation_dim, 32),
             nn.ReLU(),
@@ -167,15 +190,9 @@ class QNetwork(nn.Module):
         )
 
     def forward(self, x):
-        x= self.representation(x)
-        # print('representation', x)
-        # input('press')
         return self.network(x)
 
-    def representation(self, x):
-        x, _ = self.mutli_head_attention(x)
-        x = x.view(x.size(0), -1)
-        return self.layer_representation(x)
+    
     
 def linear_schedule(start_e: float, end_e: float, duration: int, t: int):
     slope = (end_e - start_e) / duration
@@ -250,13 +267,15 @@ poetry run pip install "stable_baselines3==2.0.0a1"
     assert isinstance(envs.single_action_space, gym.spaces.Discrete), "only discrete action space is supported"
     # bypass the attention_dim and sequence_length
     # args.attention_dim = envs.single_observation_space.shape[0] - 2 
-    q_network = QNetwork(envs, num_heads=args.num_heads, attention_dim=args.attention_dim, sequence_length=args.sequence_length, representation_dim=args.representation_dim).to(device)
-    optimizer = optim.Adam(q_network.parameters(), lr=args.learning_rate)
-    target_network = QNetwork(envs, num_heads=args.num_heads, attention_dim=args.attention_dim, sequence_length=args.sequence_length,representation_dim=args.representation_dim).to(device)
+    rp_network = RPNetwork(envs, num_heads=args.num_heads, attention_dim=args.attention_dim, sequence_length=args.sequence_length, representation_dim=args.representation_dim).to(device)
+    q_network = QNetwork(envs, representation_dim=args.representation_dim).to(device)
+    optimizer_q = optim.Adam([
+    {'params': q_network.parameters(), 'lr': args.learning_rate},
+    {'params': rp_network.parameters(), 'lr': args.lr_representation}
+])
+    
+    target_network = QNetwork(envs, representation_dim=args.representation_dim).to(device)
     target_network.load_state_dict(q_network.state_dict())
-    action_dim = 1 if isinstance(envs.single_action_space, Discrete) else envs.single_action_space.shape[0]
-    P_FORWARD = torch.nn.Parameter(torch.rand(args.representation_dim, args.representation_dim + action_dim), requires_grad=True).to(device)
-    P_BACKWARD = torch.nn.Parameter(torch.rand(action_dim, args.representation_dim*2), requires_grad=True).to(device)
     rb = ReplayBuffer(
         args.buffer_size,
         gym.spaces.Box(low=-np.inf, high=np.inf, shape=(args.sequence_length, *envs.single_observation_space.shape), dtype=np.float32),
@@ -273,7 +292,8 @@ poetry run pip install "stable_baselines3==2.0.0a1"
         # ALGO LOGIC: put action logic here
         # softmax policy
         with torch.no_grad():
-            q_values = q_network(torch.Tensor(state[:,:, [0,2,3]]).to(device))
+            rp_state = rp_network(torch.Tensor(state[:,:, [0,1,2]]).to(device))
+            q_values = q_network(rp_state).to(device)
             # q_values = q_network(torch.tensor(state, dtype=torch.float32).to(device))
             # print('q_values', q_values) if global_step > args.learning_starts else None
             policy = soft_max(q_values, args.tau_soft)
@@ -313,62 +333,67 @@ poetry run pip install "stable_baselines3==2.0.0a1"
 
         # ALGO LOGIC: training.
         if global_step > args.learning_starts:
+            # custom sampling 
+            batch_inds = np.random.randint(args.sequence_length, rb.pos, args.batch_size) if not rb.full else (np.random.randint(1+args.sequence_length, rb.buffer_size, size=args.batch_size) + rb.pos) % rb.buffer_size
+            batch_state = torch.tensor(rb.observations[batch_inds]).squeeze(1).to(device)
+            last_obs = batch_state[:,-1]
+            batch_state = batch_state[:,:, [0,1,2]]
+            batch_next_state = torch.tensor(rb.next_observations[batch_inds]).squeeze(1).to(device)
+            batch_next_state = batch_next_state[:,:, [0,1,2]]
+            batch_actions = torch.tensor(rb.actions[batch_inds]).squeeze(-1).to(device)
+            loss_td = 0
             if global_step % args.train_frequency == 0:
-                # custom sampling 
-                batch_inds = np.random.randint(args.sequence_length, rb.pos, args.batch_size) if not rb.full else (np.random.randint(1+args.sequence_length, rb.buffer_size, size=args.batch_size) + rb.pos) % rb.buffer_size
-                batch_state = torch.tensor(rb.observations[batch_inds]).squeeze(1).to(device)
-                last_obs = batch_state[:,-1]
-                batch_state = batch_state[:,:, [0,2,3]]
-                batch_next_state = torch.tensor(rb.next_observations[batch_inds]).squeeze(1).to(device)
-                batch_next_state = batch_next_state[:,:, [0,2,3]]
                 batch_rewards = torch.tensor(rb.rewards[batch_inds]).to(device)
-                batch_actions = torch.tensor(rb.actions[batch_inds]).squeeze(-1).to(device)
                 batch_dones = torch.tensor(rb.dones[batch_inds]).to(device)
                 with torch.no_grad():
                     # Q-Learning with Munchausen RL
-                    target_q_values = target_network(batch_next_state)
+                    rp_next_state = rp_network(batch_next_state)
+                    target_q_values = target_network(rp_next_state)
                     target_policy = soft_max(target_q_values, args.tau_soft)
-                    target_next_q_values = target_network(batch_next_state)
+                    target_next_q_values = target_network(rp_next_state)
                     target_next_policy = soft_max(target_next_q_values, args.tau_soft)
                     red_term = args.alpha*(args.tau_soft*torch.log(target_policy.gather(1, batch_actions))+args.epsilon_tar).clamp(args.l_0, 0.0)
                     bleu_term = -args.tau_soft * torch.log(target_next_policy+args.epsilon_tar)
                     munchausen_target = batch_rewards + red_term + \
                                         args.gamma * (1 - batch_dones) * (target_next_policy * (target_next_q_values + bleu_term)).sum(dim=-1).unsqueeze(-1)
                     td_target = munchausen_target.squeeze()
-                old_val = q_network(batch_state).gather(1, batch_actions).squeeze()
-                loss = F.mse_loss(td_target, old_val)
+                rp_state = rp_network(batch_state)
+                old_val = q_network(rp_state).gather(1, batch_actions).squeeze()
+                loss_td = F.mse_loss(td_target, old_val)
                 # Representation Learning
-                r_s= q_network.representation(batch_state)
-                r_ns_hat_a = torch.cat([r_s, batch_actions.float()], dim=1)
-                r_ns_hat = torch.mm(r_ns_hat_a, P_FORWARD.t())
-                # with torch.no_grad():
-                r_ns= q_network.representation(batch_next_state)
-                action_hat = torch.mm(torch.cat([r_s, r_ns], dim=1), P_BACKWARD.t())
+                r_s = rp_network(batch_state)
+                r_ns_hat = rp_network.forward_predict(r_s, batch_actions.float())
+                r_ns= rp_network(batch_next_state)
+                action_hat = rp_network.forward_inverse(r_s.detach(), r_ns)
                 backward_loss = F.mse_loss(action_hat, batch_actions.float())
-                forward_loss = F.mse_loss(r_ns_hat, r_ns)
-                sheet_loss = F.mse_loss(r_s, last_obs)
-                loss += args.lambda_forward*forward_loss + args.lambda_backward * backward_loss
+                forward_loss = F.mse_loss(r_ns_hat, r_ns.detach())
+                # sheet_loss = F.mse_loss(r_s, last_obs)
+                representation_loss = args.lambda_forward*forward_loss + args.lambda_backward * backward_loss 
                 # loss += args.lambda_r*sheet_loss
-                
-
-                if global_step % 100 == 0:
-                    writer.add_scalar("losses/td_loss", loss, global_step)
-                    writer.add_scalar("losses/q_values", old_val.mean().item(), global_step)
-                    writer.add_scalar("losses/td_target", td_target.mean().item(), global_step)
-                    writer.add_scalar("losses/log_policy", red_term.mean().item(), global_step)
-                    writer.add_scalar("losses/entropy", bleu_term.mean().item(), global_step)
-                    writer.add_scalar("losses/munchausen_target", munchausen_target.mean().item(), global_step)
-                    writer.add_scalar("losses/forward_loss", forward_loss, global_step)
-                    writer.add_scalar("losses/backward_loss", backward_loss, global_step)
-                    writer.add_scalar("losses/sheet_loss", sheet_loss, global_step)
-                    # print('representation_loss', representation_loss)
-                    print("SPS:", int(global_step / (time.time() - start_time)))
-                    writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
-
-                # optimize the model
-                optimizer.zero_grad()
+                loss  = loss_td + args.lambda_td * representation_loss
+                 # modify gradient for representation learning on td loss
+                optimizer_q.zero_grad()
                 loss.backward()
-                optimizer.step()
+                optimizer_q.step()
+
+            if global_step % 100 == 0 :
+                writer.add_scalar("losses/td_loss", loss_td, global_step)
+                writer.add_scalar("losses/q_values", old_val.mean().item(), global_step)
+                writer.add_scalar("losses/td_target", td_target.mean().item(), global_step)
+                writer.add_scalar("losses/log_policy", red_term.mean().item(), global_step)
+                writer.add_scalar("losses/entropy", bleu_term.mean().item(), global_step)
+                writer.add_scalar("losses/munchausen_target", munchausen_target.mean().item(), global_step)
+                writer.add_scalar("losses/forward_loss", forward_loss, global_step)
+                writer.add_scalar("losses/backward_loss", backward_loss, global_step)
+                # writer.add_scalar("losses/sheet_loss", sheet_loss, global_step)
+                # print('representation_loss', representation_loss)
+                print("SPS:", int(global_step / (time.time() - start_time)))
+                writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
+
+           
+
+
+                
 
             # update target network
             if global_step % args.target_network_frequency == 0:
