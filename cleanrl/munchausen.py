@@ -13,7 +13,7 @@ import torch.optim as optim
 import tyro
 from stable_baselines3.common.buffers import ReplayBuffer
 from torch.utils.tensorboard import SummaryWriter
-
+from stable_baselines3.common.type_aliases import ReplayBufferSamples
 
 @dataclass
 class Args:
@@ -122,6 +122,23 @@ def soft_max(q_values, tau):
     return F.softmax(q_values / tau, dim=-1)
 
 
+def _get_samples(batch_inds, rb, env = None):
+    # Sample randomly the env idx
+    env_indices = np.random.randint(0, high=rb.n_envs, size=(len(batch_inds),))
+    if rb.optimize_memory_usage:
+        next_obs = rb._normalize_obs(rb.observations[(batch_inds + 1) % rb.buffer_size, env_indices, :], env)
+    else:
+        next_obs = rb._normalize_obs(rb.next_observations[batch_inds, env_indices, :], env)
+    data = (
+        rb._normalize_obs(rb.observations[batch_inds, env_indices, :], env),
+        rb.actions[batch_inds, env_indices, :],
+        next_obs,
+        # Only use dones that are not due to timeouts
+        # deactivated by default (timeouts is initialized as an array of False)
+        (rb.dones[batch_inds, env_indices] * (1 - rb.timeouts[batch_inds, env_indices])).reshape(-1, 1),
+        rb._normalize_reward(rb.rewards[batch_inds, env_indices].reshape(-1, 1), env),
+    )
+    return ReplayBufferSamples(*tuple(map(rb.to_torch, data)))
 
 
 if __name__ == "__main__":
@@ -216,7 +233,17 @@ poetry run pip install "stable_baselines3==2.0.0a1"
         # ALGO LOGIC: training.
         if global_step > args.learning_starts:
             if global_step % args.train_frequency == 0:
-                data = rb.sample(args.batch_size)
+                # data = rb.sample(args.batch_size)
+                # custom sampling 
+                batch_inds = np.random.randint(0, rb.pos, args.batch_size) if not rb.full else (np.random.randint(1, rb.buffer_size, size=args.batch_size) + rb.pos) % rb.buffer_size
+                data = _get_samples(batch_inds, rb)
+                # batch_obs = rb.observations[batch_inds]
+                # batch_next_obs = rb.next_observations[batch_inds]
+                # batch_actions = rb.actions[batch_inds]
+                # batch_rewards = rb.rewards[batch_inds]
+                # batch_dones = rb.dones[batch_inds]
+
+     
                 with torch.no_grad():
                     target_q_values = target_network(data.next_observations)
                     target_policy = soft_max(target_q_values, args.tau_soft)
