@@ -28,7 +28,7 @@ class Args:
     """if toggled, `torch.backends.cudnn.deterministic=False`"""
     cuda: bool = True
     """if toggled, cuda will be enabled by default"""
-    track: bool = True
+    track: bool = False
     """if toggled, this experiment will be tracked with Weights and Biases"""
     wandb_project_name: str = "cleanRLTest"
     """the wandb's project name"""
@@ -83,7 +83,7 @@ class Args:
     # TRANSFORMER SPECIFIC
     num_heads: int = 4
     """the number of attention heads"""
-    attention_dim: int = 16
+    attention_dim: int = 8
     """the dimension of the attention layer"""
     sequence_length: int = 2
     """the length of the sequence"""
@@ -156,18 +156,35 @@ class MultiHeadAttention(nn.Module):
         return output, attention_weights
 
 class RPNetwork(nn.Module):
-    def __init__(self, env, num_heads, attention_dim, sequence_length, representation_dim):
+    def __init__(self, env, num_heads, attention_dim, sequence_length, representation_dim, dim_reduction=1):
         super(RPNetwork, self).__init__()
-        self.mutli_head_attention = MultiHeadAttention(np.array(env.single_observation_space.shape).prod()-1, num_heads, attention_dim)
-        self.layer_representation = nn.Linear(sequence_length*(np.array(env.single_observation_space.shape).prod()-1), representation_dim)
+        self.mutli_head_attention = MultiHeadAttention(np.array(env.single_observation_space.shape).prod()-dim_reduction, num_heads, attention_dim)
+        self.layer_norm_attention = nn.LayerNorm(np.array(env.single_observation_space.shape).prod()-dim_reduction)
+        self.feed_forward = nn.Sequential(
+            nn.Linear(np.array(env.single_observation_space.shape).prod()-dim_reduction, representation_dim),
+            nn.ReLU(),
+            nn.Linear(representation_dim, np.array(env.single_observation_space.shape).prod()-dim_reduction),
+        )
+        self.layer_norm_feed_forward = nn.LayerNorm(np.array(env.single_observation_space.shape).prod()-dim_reduction)
+        self.layer_representation = nn.Linear(sequence_length*(np.array(env.single_observation_space.shape).prod()-dim_reduction), representation_dim)
         action_dim = 1 if isinstance(env.single_action_space, Discrete) else env.single_action_space.shape[0]
         self.predictive_layer = nn.Linear(representation_dim + action_dim,representation_dim)
         self.inverse_layer = nn.Linear(representation_dim*2, action_dim)
 
-    def forward(self, x):
-        x, _ = self.mutli_head_attention(x)
-        x = x.view(x.size(0), -1)
-        return self.layer_representation(x)
+    def forward(self, sequence_observation):
+        # multi-head attention
+        x, _ = self.mutli_head_attention(sequence_observation)
+        # residual connection + layer norm
+        z = self.layer_norm_attention(sequence_observation + x)
+        # feed forward  
+        x = self.feed_forward(z)
+        # residual connection + layer norm
+        z = self.layer_norm_feed_forward(z + x)
+        # flatten
+        z = z.view(z.size(0), -1)
+        # representation layer
+        z = self.layer_representation(z)
+        return z
     
     def forward_predict(self, x, a):
         x = torch.cat([x, a], dim=1)
@@ -202,24 +219,6 @@ def soft_max(q_values, tau):
     return F.softmax(q_values / tau, dim=-1)
 
 
-
-# def _get_samples(batch_inds, rb, env = None):
-#     # Sample randomly the env idx
-#     env_indices = np.random.randint(0, high=rb.n_envs, size=(len(batch_inds),))
-#     if rb.optimize_memory_usage:
-#         next_obs = rb._normalize_obs(rb.observations[(batch_inds + 1) % rb.buffer_size, env_indices, :], env)
-#     else:
-#         next_obs = rb._normalize_obs(rb.next_observations[batch_inds, env_indices, :], env)
-#     data = (
-#         rb._normalize_obs(rb.observations[batch_inds, env_indices, :], env),
-#         rb.actions[batch_inds, env_indices, :],
-#         next_obs,
-#         # Only use dones that are not due to timeouts
-#         # deactivated by default (timeouts is initialized as an array of False)
-#         (rb.dones[batch_inds, env_indices] * (1 - rb.timeouts[batch_inds, env_indices])).reshape(-1, 1),
-#         rb._normalize_reward(rb.rewards[batch_inds, env_indices].reshape(-1, 1), env),
-#     )
-#     return ReplayBufferSamples(*tuple(map(rb.to_torch, data)))
 
 if __name__ == "__main__":
     import stable_baselines3 as sb3
