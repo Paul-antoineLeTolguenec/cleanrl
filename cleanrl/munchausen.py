@@ -13,21 +13,20 @@ import torch.optim as optim
 import tyro
 from stable_baselines3.common.buffers import ReplayBuffer
 from torch.utils.tensorboard import SummaryWriter
-from stable_baselines3.common.type_aliases import ReplayBufferSamples
 
 @dataclass
 class Args:
     exp_name: str = os.path.basename(__file__)[: -len(".py")]
     """the name of this experiment"""
-    seed: int = 1
+    seed: int = 2
     """seed of the experiment"""
     torch_deterministic: bool = True
     """if toggled, `torch.backends.cudnn.deterministic=False`"""
     cuda: bool = True
     """if toggled, cuda will be enabled by default"""
-    track: bool = True
+    track: bool = False
     """if toggled, this experiment will be tracked with Weights and Biases"""
-    wandb_project_name: str = "cleanRLTest"
+    wandb_project_name: str = "cleanRL"
     """the wandb's project name"""
     wandb_entity: str = None
     """the entity (team) of wandb's project"""
@@ -59,21 +58,15 @@ class Args:
     """the timesteps it takes to update the target network"""
     batch_size: int = 128
     """the batch size of sample from the reply memory"""
-    start_e: float = 1
-    """the starting epsilon for exploration"""
-    end_e: float = 0.05
-    """the ending epsilon for exploration"""
-    exploration_fraction: float = 0.5
-    """the fraction of `total-timesteps` it takes from start-e to go end-e"""
     learning_starts: int = 10000
     """timestep to start learning"""
     train_frequency: int = 10
     """the frequency of training"""
-    tau_soft : float = 0.03
+    tau_soft : float = 0.03 # see Page 19 https://arxiv.org/pdf/2007.14430
     """the temperature parameter for the soft-max policy"""
-    alpha : float = 0.9
+    alpha : float = 0.9 # see Page 19 https://arxiv.org/pdf/2007.14430
     """the entropy regularization parameter"""
-    l_0 : float = -1.0
+    l_0 : float = -1.0 # see Page 19 https://arxiv.org/pdf/2007.14430
     """the lower bound of the weighted log probability"""
     epsilon_tar : float = 1e-6
     """the epsilon term for numerical stability"""
@@ -122,23 +115,6 @@ def soft_max(q_values, tau):
     return F.softmax(q_values / tau, dim=-1)
 
 
-def _get_samples(batch_inds, rb, env = None):
-    # Sample randomly the env idx
-    env_indices = np.random.randint(0, high=rb.n_envs, size=(len(batch_inds),))
-    if rb.optimize_memory_usage:
-        next_obs = rb._normalize_obs(rb.observations[(batch_inds + 1) % rb.buffer_size, env_indices, :], env)
-    else:
-        next_obs = rb._normalize_obs(rb.next_observations[batch_inds, env_indices, :], env)
-    data = (
-        rb._normalize_obs(rb.observations[batch_inds, env_indices, :], env),
-        rb.actions[batch_inds, env_indices, :],
-        next_obs,
-        # Only use dones that are not due to timeouts
-        # deactivated by default (timeouts is initialized as an array of False)
-        (rb.dones[batch_inds, env_indices] * (1 - rb.timeouts[batch_inds, env_indices])).reshape(-1, 1),
-        rb._normalize_reward(rb.rewards[batch_inds, env_indices].reshape(-1, 1), env),
-    )
-    return ReplayBufferSamples(*tuple(map(rb.to_torch, data)))
 
 
 if __name__ == "__main__":
@@ -209,6 +185,7 @@ poetry run pip install "stable_baselines3==2.0.0a1"
             q_values = q_network(torch.Tensor(obs).to(device))
             policy = soft_max(q_values, args.tau_soft)
             actions = torch.multinomial(policy, 1).squeeze(-1).cpu().numpy()
+
         # TRY NOT TO MODIFY: execute the game and log data.
         next_obs, rewards, terminations, truncations, infos = envs.step(actions)
 
@@ -233,26 +210,17 @@ poetry run pip install "stable_baselines3==2.0.0a1"
         # ALGO LOGIC: training.
         if global_step > args.learning_starts:
             if global_step % args.train_frequency == 0:
-                # data = rb.sample(args.batch_size)
-                # custom sampling 
-                batch_inds = np.random.randint(0, rb.pos, args.batch_size) if not rb.full else (np.random.randint(1, rb.buffer_size, size=args.batch_size) + rb.pos) % rb.buffer_size
-                data = _get_samples(batch_inds, rb)
-                # batch_obs = rb.observations[batch_inds]
-                # batch_next_obs = rb.next_observations[batch_inds]
-                # batch_actions = rb.actions[batch_inds]
-                # batch_rewards = rb.rewards[batch_inds]
-                # batch_dones = rb.dones[batch_inds]
-
-     
+                data = rb.sample(args.batch_size)
                 with torch.no_grad():
                     target_q_values = target_network(data.next_observations)
                     target_policy = soft_max(target_q_values, args.tau_soft)
                     target_next_q_values = target_network(data.next_observations)
                     target_next_policy = soft_max(target_next_q_values, args.tau_soft)
-                    red_term = args.alpha*(args.tau_soft*torch.log(target_policy.gather(1, data.actions))+args.epsilon_tar).clamp(args.l_0, 0.0)
-                    bleu_term = -args.tau_soft * torch.log(target_next_policy+args.epsilon_tar)
-                    munchausen_target = data.rewards + red_term + \
-                                        args.gamma * (1 - data.dones) * (target_next_policy * (target_next_q_values + bleu_term)).sum(dim=-1).unsqueeze(-1)
+                    red_term = args.alpha*(args.tau_soft*torch.log(target_policy.gather(1, data.actions))+args.epsilon_tar).clamp(args.l_0, 0.0) #red term in https://arxiv.org/pdf/2007.14430
+                    blue_term = -args.tau_soft * torch.log(target_next_policy+args.epsilon_tar) #blue term https://arxiv.org/pdf/2007.14430
+                    munchausen_target = data.rewards + \
+                                        red_term + \
+                                        args.gamma * (1 - data.dones) * (target_next_policy * (target_next_q_values + blue_term)).sum(dim=-1).unsqueeze(-1) 
                     td_target = munchausen_target.squeeze()
                 old_val = q_network(data.observations).gather(1, data.actions).squeeze()
                 loss = F.mse_loss(td_target, old_val)
@@ -262,7 +230,7 @@ poetry run pip install "stable_baselines3==2.0.0a1"
                     writer.add_scalar("losses/q_values", old_val.mean().item(), global_step)
                     writer.add_scalar("losses/td_target", td_target.mean().item(), global_step)
                     writer.add_scalar("losses/log_policy", red_term.mean().item(), global_step)
-                    writer.add_scalar("losses/entropy", bleu_term.mean().item(), global_step)
+                    writer.add_scalar("losses/entropy", blue_term.mean().item(), global_step)
                     print("SPS:", int(global_step / (time.time() - start_time)))
                     writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
 
