@@ -99,12 +99,12 @@ def make_env(env_id, seed, idx, capture_video, run_name):
 class SoftQNetwork(nn.Module):
     def __init__(self, env):
         super().__init__()
-        self.fc1 = nn.Linear(np.array(env.single_observation_space.shape).prod() + np.prod(env.single_action_space.shape), 256)
+        self.fc1 = nn.Linear(np.array(env.single_observation_space.shape).prod()*2 + np.prod(env.single_action_space.shape), 256)
         self.fc2 = nn.Linear(256, 256)
         self.fc3 = nn.Linear(256, 1)
 
-    def forward(self, x, a):
-        x = torch.cat([x, a], 1)
+    def forward(self, x, dx_delta,  a):
+        x = torch.cat([x, dx_delta, a], dim=1)
         x = F.relu(self.fc1(x))
         x = F.relu(self.fc2(x))
         x = self.fc3(x)
@@ -118,7 +118,7 @@ LOG_STD_MIN = -5
 class Actor(nn.Module):
     def __init__(self, env):
         super().__init__()
-        self.fc1 = nn.Linear(np.array(env.single_observation_space.shape).prod(), 256)
+        self.fc1 = nn.Linear(np.array(env.single_observation_space.shape).prod()*2, 256)
         self.fc2 = nn.Linear(256, 256)
         self.fc_mean = nn.Linear(256, np.prod(env.single_action_space.shape))
         self.fc_logstd = nn.Linear(256, np.prod(env.single_action_space.shape))
@@ -130,7 +130,8 @@ class Actor(nn.Module):
             "action_bias", torch.tensor((env.action_space.high + env.action_space.low) / 2.0, dtype=torch.float32)
         )
 
-    def forward(self, x):
+    def forward(self, x, dx_delta):
+        x = torch.cat([x, dx_delta], dim=1)
         x = F.relu(self.fc1(x))
         x = F.relu(self.fc2(x))
         mean = self.fc_mean(x)
@@ -140,8 +141,8 @@ class Actor(nn.Module):
 
         return mean, log_std
 
-    def get_action(self, x):
-        mean, log_std = self(x)
+    def get_action(self, x, dx_delta):
+        mean, log_std = self(x, dx_delta)
         std = log_std.exp()
         normal = torch.distributions.Normal(mean, std)
         x_t = normal.rsample()  # for reparameterization trick (mean + std * N(0,1))
@@ -232,7 +233,8 @@ poetry run pip install "stable_baselines3==2.0.0a1"
 
     # TRY NOT TO MODIFY: start the game
     obs, _ = envs.reset(seed=args.seed)
-    delta_t = 0
+    dobs_delta = obs*0
+    time_step = 0
     for global_step in range(args.total_timesteps):
         # ALGO LOGIC: put action logic here
         if global_step < args.learning_starts:
@@ -243,10 +245,18 @@ poetry run pip install "stable_baselines3==2.0.0a1"
 
         # TRY NOT TO MODIFY: execute the game and log data.
         next_obs, rewards, terminations, truncations, infos = envs.step(actions)
+        time_step += 1
 
+        # intrinsic reward
+        intrinsic_reward = 0
+        if rb.pos > args.delta:
+            dobs = next_obs - obs
+            dobs_delta =  rb.next_observations[rb.pos - args.delta + 1] - rb.observations[rb.pos - args.delta + 1]
+            c = np.einsum('bi,bj->bij', dobs, dobs_delta)
+            intrinsic_reward = np.abs(np.sum(np.einsum('...ij,...j->...i', c, dobs) * eigen_vector.numpy(), axis=1))
+            rewards = rewards*0.0 + intrinsic_reward
+        
 
-        # TODO : Compute C
-        delta_t += 1
 
 
         # TRY NOT TO MODIFY: record rewards for plotting purposes
@@ -256,6 +266,7 @@ poetry run pip install "stable_baselines3==2.0.0a1"
                 writer.add_scalar("charts/episodic_return", info["episode"]["r"], global_step)
                 writer.add_scalar("charts/episodic_length", info["episode"]["l"], global_step)
                 break
+            time_step = 0
 
         # TRY NOT TO MODIFY: save data to reply buffer; handle `final_observation`
         real_next_obs = next_obs.copy()
@@ -288,14 +299,14 @@ poetry run pip install "stable_baselines3==2.0.0a1"
                 qf2_next_target = qf2_target(next_observations, next_state_actions)
                 min_qf_next_target = torch.min(qf1_next_target, qf2_next_target) - alpha * next_state_log_pi
                 # update C
-                d_obs = next_observations - observations
-                d_obs_delta = next_observations_delta - observations_delta
-                d_obs = d_obs - d_obs.mean(dim=0, keepdim=True)
-                d_obs_delta = d_obs_delta - d_obs_delta.mean(dim=0, keepdim=True)
-                cov_d_obs = torch.einsum('bi,bj->bij', d_obs, d_obs_delta)
-                C = (1 - args.tau_covariance) * C + args.tau_covariance * cov_d_obs.mean(dim=0)
-                intrinsic_reward= torch.abs(torch.sum(torch.einsum('ij,bj->bi', C, d_obs) * eigen_vector, dim=1))
-                rewards = rewards.flatten()*0.0 + intrinsic_reward*1e5
+                # d_obs = next_observations - observations
+                # d_obs_delta = next_observations_delta - observations_delta
+                # d_obs = d_obs - d_obs.mean(dim=0, keepdim=True)
+                # d_obs_delta = d_obs_delta - d_obs_delta.mean(dim=0, keepdim=True)
+                # cov_d_obs = torch.einsum('bi,bj->bij', d_obs, d_obs_delta)
+                # C = (1 - args.tau_covariance) * C + args.tau_covariance * cov_d_obs.mean(dim=0)
+                # intrinsic_reward= torch.abs(torch.sum(torch.einsum('ij,bj->bi', C, d_obs) * eigen_vector, dim=1))
+                # rewards = rewards.flatten()*0.0 + intrinsic_reward*1e5
                 # C = (1 - args.tau_covariance) * C + args.tau_covariance * torch.ger(observations.flatten(), observations.flatten())
 
 
@@ -352,9 +363,9 @@ poetry run pip install "stable_baselines3==2.0.0a1"
                 writer.add_scalar("losses/actor_loss", actor_loss.item(), global_step)
                 writer.add_scalar("losses/alpha", alpha, global_step)
                 print("SPS:", int(global_step / (time.time() - start_time)))
-                print('mean intrinsic reward :', intrinsic_reward.mean().item())
-                print('max intrinsic reward :', intrinsic_reward.max().item())
-                print('min intrinsic reward :', intrinsic_reward.min().item())
+                print('mean reward :',rewards.mean().item())
+                print('max intrinsic reward :',rewards.max().item())
+                print('min reward :',rewards.min().item())
                 print('C :', C)
                 writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
                 if args.autotune:
