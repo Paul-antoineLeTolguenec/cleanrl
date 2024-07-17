@@ -3,6 +3,7 @@ from gymnasium.spaces import Discrete, Box
 import matplotlib.pyplot as plt
 import numpy as np
 import copy
+from moviepy.editor import ImageSequenceClip
 
 
 class Maze(gym.Env):
@@ -16,7 +17,7 @@ class Maze(gym.Env):
             self.y=0
             self.dx=0
             self.dy=0
-            self.dt=2e-2
+            self.dt=5e-2
             self.max_x=1
             self.max_y=1
             self.min_x=-1
@@ -36,12 +37,13 @@ class Maze(gym.Env):
             self.episode_reward = 0
             self.seed = seed
             self.d = 0
+            self.render_mode = render_mode
             if name!=None:
                 self.x_init = Mazes[name]['x_init']
                 self.y_init = Mazes[name]['y_init']
                 for wall in Mazes[name]['walls'] : self.walls.append(wall)
                 target = Mazes[name]['target']
-            self.fig, self.ax = plt.subplots() if render_mode == 'human' else (None, None)
+            self.fig, self.ax = plt.subplots() if render else (None, None)
             
 
         def reward(self):
@@ -134,16 +136,36 @@ class Maze(gym.Env):
 
             return (new_x, new_y)
 
-        def render(self):
-            self.ax.clear()
-            self.ax.set_xlim(self.min_x, self.max_x)
-            self.ax.set_ylim(self.min_y, self.max_y)
-            for wall in self.walls:
-                self.ax.plot([wall[0], wall[2]], [wall[1], wall[3]], 'k-')
-            self.ax.plot(self.target[0], self.target[1], 'ro')
-            self.ax.plot(self.x, self.y, 'bo')
-            plt.pause(0.001)
-            plt.draw()
+        def render(self, render_mode = 'rgb_array'):
+            if self.render_mode == 'human' or render_mode == 'human':
+                self.ax.clear()
+                self.ax.set_xlim(self.min_x, self.max_x)
+                self.ax.set_ylim(self.min_y, self.max_y)
+                for wall in self.walls:
+                    self.ax.plot([wall[0], wall[2]], [wall[1], wall[3]], 'k-')
+                self.ax.plot(self.target[0], self.target[1], 'ro')
+                self.ax.plot(self.x, self.y, 'bo')
+                plt.draw()
+            elif self.render_mode == 'rgb_array' or render_mode == 'rgb_array':
+                self.ax.clear()
+                self.ax.set_xlim(self.min_x, self.max_x)
+                self.ax.set_ylim(self.min_y, self.max_y)
+                for wall in self.walls:
+                    self.ax.plot([wall[0], wall[2]], [wall[1], wall[3]], 'k-')
+                self.ax.plot(self.target[0], self.target[1], 'ro')
+                self.ax.plot(self.x, self.y, 'bo')
+                self.fig.canvas.draw()
+                # Now we can save it to a numpy array.
+                data = np.fromstring(self.fig.canvas.tostring_rgb(), dtype=np.uint8, sep='')
+                data = data.reshape(self.fig.canvas.get_width_height()[::-1] + (3,))
+                return data
+            
+        def save_video(self, frames , filename='video.mp4', fps=4):
+            clip = ImageSequenceClip(frames, fps=fps)
+            clip.write_videofile(filename)
+
+
+
         def close(self):
             plt.close()
 

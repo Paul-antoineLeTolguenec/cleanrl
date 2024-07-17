@@ -35,10 +35,16 @@ class Args:
     """the entity (team) of wandb's project"""
     capture_video: bool = False
     """whether to capture videos of the agent performances (check out `videos` folder)"""
+    episodes_captured: int = 1
+    """how many episodes to capture"""
+    freq_videos: int = 5_000
+    """capture video every `freq_videos` steps"""
 
     # Algorithm specific arguments
     env_id: str = "Maze-Easy-v1"
     """the environment id of the task"""
+    num_envs: int = 1
+    """the number of parallel game environments to run"""
     total_timesteps: int = 1000000
     """total timesteps of the experiments"""
     buffer_size: int = int(1e6)
@@ -63,6 +69,16 @@ class Args:
     """Entropy regularization coefficient."""
     autotune: bool = True
     """automatic tuning of the entropy coefficient"""
+
+    # plasticity specific arguments
+    eigen_vector: tuple = (1, 0)
+    """the eigen vector of the covariance matrix"""
+    lambda_plasticity: float = 0.1
+    """the plasticity coefficient"""
+    delta: int = 2
+    """the time step between st and st+delta_t"""
+    tau_covariance: float = 0.1
+    """the covariance smoothing coefficient"""
 
 
 def make_env(env_id, seed, idx, capture_video, run_name):
@@ -192,6 +208,8 @@ poetry run pip install "stable_baselines3==2.0.0a1"
     qf2_target.load_state_dict(qf2.state_dict())
     q_optimizer = optim.Adam(list(qf1.parameters()) + list(qf2.parameters()), lr=args.q_lr)
     actor_optimizer = optim.Adam(list(actor.parameters()), lr=args.policy_lr)
+    C = torch.zeros((np.prod(envs.single_observation_space.shape), np.prod(envs.single_observation_space.shape)))
+    eigen_vector = torch.tensor(args.eigen_vector, dtype=torch.float32)
 
     # Automatic entropy tuning
     if args.autotune:
@@ -225,6 +243,9 @@ poetry run pip install "stable_baselines3==2.0.0a1"
         # TRY NOT TO MODIFY: execute the game and log data.
         next_obs, rewards, terminations, truncations, infos = envs.step(actions)
 
+
+        # TODO : Compute C
+
         # TRY NOT TO MODIFY: record rewards for plotting purposes
         if "final_info" in infos:
             for info in infos["final_info"]:
@@ -245,16 +266,40 @@ poetry run pip install "stable_baselines3==2.0.0a1"
 
         # ALGO LOGIC: training.
         if global_step > args.learning_starts:
-            data = rb.sample(args.batch_size)
-            with torch.no_grad():
-                next_state_actions, next_state_log_pi, _ = actor.get_action(data.next_observations)
-                qf1_next_target = qf1_target(data.next_observations, next_state_actions)
-                qf2_next_target = qf2_target(data.next_observations, next_state_actions)
-                min_qf_next_target = torch.min(qf1_next_target, qf2_next_target) - alpha * next_state_log_pi
-                next_q_value = data.rewards.flatten() + (1 - data.dones.flatten()) * args.gamma * (min_qf_next_target).view(-1)
+            # data = rb.sample(args.batch_size)
+            batch_inds = np.random.randint(args.delta, rb.pos, args.batch_size)
+            batch_inds_delta = batch_inds - args.delta
+            batch_inds_envs = np.random.randint(0, args.num_envs, args.batch_size)
+            observations = torch.tensor(rb.observations[batch_inds, batch_inds_envs]).to(device)
+            next_observations = torch.tensor(rb.next_observations[batch_inds, batch_inds_envs]).to(device)
+            actions = torch.tensor(rb.actions[batch_inds, batch_inds_envs]).to(device)
+            rewards = torch.tensor(rb.rewards[batch_inds, batch_inds_envs]).to(device)
+            dones = torch.tensor(rb.dones[batch_inds, batch_inds_envs]).to(device)
+            # -delta 
+            observations_delta = torch.tensor(rb.observations[batch_inds_delta, batch_inds_envs]).to(device)
+            next_observations_delta = torch.tensor(rb.next_observations[batch_inds_delta, batch_inds_envs]).to(device)
 
-            qf1_a_values = qf1(data.observations, data.actions).view(-1)
-            qf2_a_values = qf2(data.observations, data.actions).view(-1)
+            with torch.no_grad():
+                next_state_actions, next_state_log_pi, _ = actor.get_action(next_observations)
+                qf1_next_target = qf1_target(next_observations, next_state_actions)
+                qf2_next_target = qf2_target(next_observations, next_state_actions)
+                min_qf_next_target = torch.min(qf1_next_target, qf2_next_target) - alpha * next_state_log_pi
+                # update C
+                d_obs = next_observations - observations
+                d_obs_delta = next_observations_delta - observations_delta
+                d_obs = d_obs - d_obs.mean(dim=0, keepdim=True)
+                d_obs_delta = d_obs_delta - d_obs_delta.mean(dim=0, keepdim=True)
+                cov_d_obs = torch.einsum('bi,bj->bij', d_obs, d_obs_delta)
+                C = (1 - args.tau_covariance) * C + args.tau_covariance * cov_d_obs.sum(dim=0)
+                intrinsic_reward= torch.abs(torch.sum(torch.einsum('ij,bj->bi', C, d_obs) * eigen_vector, dim=1))
+                reward = rewards.flatten() + intrinsic_reward*1000
+                # C = (1 - args.tau_covariance) * C + args.tau_covariance * torch.ger(observations.flatten(), observations.flatten())
+
+
+                next_q_value = rewards.flatten() + (1 - dones.flatten()) * args.gamma * (min_qf_next_target).view(-1)
+
+            qf1_a_values = qf1(observations, actions).view(-1)
+            qf2_a_values = qf2(observations, actions).view(-1)
             qf1_loss = F.mse_loss(qf1_a_values, next_q_value)
             qf2_loss = F.mse_loss(qf2_a_values, next_q_value)
             qf_loss = qf1_loss + qf2_loss
@@ -268,9 +313,9 @@ poetry run pip install "stable_baselines3==2.0.0a1"
                 for _ in range(
                     args.policy_frequency
                 ):  # compensate for the delay by doing 'actor_update_interval' instead of 1
-                    pi, log_pi, _ = actor.get_action(data.observations)
-                    qf1_pi = qf1(data.observations, pi)
-                    qf2_pi = qf2(data.observations, pi)
+                    pi, log_pi, _ = actor.get_action(observations)
+                    qf1_pi = qf1(observations, pi)
+                    qf2_pi = qf2(observations, pi)
                     min_qf_pi = torch.min(qf1_pi, qf2_pi)
                     actor_loss = ((alpha * log_pi) - min_qf_pi).mean()
 
@@ -280,7 +325,7 @@ poetry run pip install "stable_baselines3==2.0.0a1"
 
                     if args.autotune:
                         with torch.no_grad():
-                            _, log_pi, _ = actor.get_action(data.observations)
+                            _, log_pi, _ = actor.get_action(observations)
                         alpha_loss = (-log_alpha.exp() * (log_pi + target_entropy)).mean()
 
                         a_optimizer.zero_grad()
@@ -304,21 +349,27 @@ poetry run pip install "stable_baselines3==2.0.0a1"
                 writer.add_scalar("losses/actor_loss", actor_loss.item(), global_step)
                 writer.add_scalar("losses/alpha", alpha, global_step)
                 print("SPS:", int(global_step / (time.time() - start_time)))
+                print('mean intrinsic reward :', intrinsic_reward.mean().item())
+                print('max intrinsic reward :', intrinsic_reward.max().item())
+                print('min intrinsic reward :', intrinsic_reward.min().item())
                 writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
                 if args.autotune:
                     writer.add_scalar("losses/alpha_loss", alpha_loss.item(), global_step)
-        if global_step % 1_000 == 0 and global_step > 0:
-            env_plot = gym.make(args.env_id, render_mode="human")
+        if global_step % args.freq_videos == 0 and global_step > 0:
+            env_plot = gym.make(args.env_id, render_mode=None, render = True)
+            frames = []
             state, _ = env_plot.reset()
-            for k in range(2): 
+            for k in range(args.episodes_captured): 
                 print('episode played :', k)
                 state, _ = env_plot.reset()
                 d = False 
                 while not d: 
                     a, _, _= actor.get_action(torch.Tensor(state).to(device).unsqueeze(0))
                     state, _, d, _ , _= env_plot.step(a[0].detach().cpu().numpy())
-                    env_plot.render()
+                    frames.append(env_plot.render())
+            env_plot.save_video(frames = frames, filename=f"videos/{run_name}_episode_{global_step}.mp4", fps=4)
             env_plot.close()
+
 
     envs.close()
     writer.close()
