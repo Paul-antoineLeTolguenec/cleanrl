@@ -65,7 +65,7 @@ class Args:
     """the frequency of training policy (delayed)"""
     target_network_frequency: int = 1  # Denis Yarats' implementation delays this by 2.
     """the frequency of updates for the target nerworks"""
-    alpha: float = 0.2
+    alpha: float = 0.001
     """Entropy regularization coefficient."""
     autotune: bool = True
     """automatic tuning of the entropy coefficient"""
@@ -75,9 +75,9 @@ class Args:
     """the eigen vector of the covariance matrix"""
     lambda_plasticity: float = 0.1
     """the plasticity coefficient"""
-    delta: int = 2
+    delta: int = 4
     """the time step between st and st+delta_t"""
-    tau_covariance: float = 0.1
+    tau_covariance: float = 0.01
     """the covariance smoothing coefficient"""
 
 
@@ -232,6 +232,7 @@ poetry run pip install "stable_baselines3==2.0.0a1"
 
     # TRY NOT TO MODIFY: start the game
     obs, _ = envs.reset(seed=args.seed)
+    delta_t = 0
     for global_step in range(args.total_timesteps):
         # ALGO LOGIC: put action logic here
         if global_step < args.learning_starts:
@@ -245,6 +246,8 @@ poetry run pip install "stable_baselines3==2.0.0a1"
 
 
         # TODO : Compute C
+        delta_t += 1
+
 
         # TRY NOT TO MODIFY: record rewards for plotting purposes
         if "final_info" in infos:
@@ -290,9 +293,9 @@ poetry run pip install "stable_baselines3==2.0.0a1"
                 d_obs = d_obs - d_obs.mean(dim=0, keepdim=True)
                 d_obs_delta = d_obs_delta - d_obs_delta.mean(dim=0, keepdim=True)
                 cov_d_obs = torch.einsum('bi,bj->bij', d_obs, d_obs_delta)
-                C = (1 - args.tau_covariance) * C + args.tau_covariance * cov_d_obs.sum(dim=0)
+                C = (1 - args.tau_covariance) * C + args.tau_covariance * cov_d_obs.mean(dim=0)
                 intrinsic_reward= torch.abs(torch.sum(torch.einsum('ij,bj->bi', C, d_obs) * eigen_vector, dim=1))
-                reward = rewards.flatten() + intrinsic_reward*1000
+                rewards = rewards.flatten()*0.0 + intrinsic_reward*1e5
                 # C = (1 - args.tau_covariance) * C + args.tau_covariance * torch.ger(observations.flatten(), observations.flatten())
 
 
@@ -352,6 +355,7 @@ poetry run pip install "stable_baselines3==2.0.0a1"
                 print('mean intrinsic reward :', intrinsic_reward.mean().item())
                 print('max intrinsic reward :', intrinsic_reward.max().item())
                 print('min intrinsic reward :', intrinsic_reward.min().item())
+                print('C :', C)
                 writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
                 if args.autotune:
                     writer.add_scalar("losses/alpha_loss", alpha_loss.item(), global_step)
