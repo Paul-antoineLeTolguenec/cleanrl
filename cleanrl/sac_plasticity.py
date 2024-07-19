@@ -240,7 +240,7 @@ poetry run pip install "stable_baselines3==2.0.0a1"
         if global_step < args.learning_starts:
             actions = np.array([envs.single_action_space.sample() for _ in range(envs.num_envs)])
         else:
-            actions, _, _ = actor.get_action(torch.Tensor(obs).to(device))
+            actions, _, _ = actor.get_action(torch.Tensor(obs).to(device), torch.Tensor(dobs_delta).to(device))
             actions = actions.detach().cpu().numpy()
 
         # TRY NOT TO MODIFY: execute the game and log data.
@@ -254,7 +254,7 @@ poetry run pip install "stable_baselines3==2.0.0a1"
             dobs_delta =  rb.next_observations[rb.pos - args.delta + 1] - rb.observations[rb.pos - args.delta + 1]
             c = np.einsum('bi,bj->bij', dobs, dobs_delta)
             intrinsic_reward = np.abs(np.sum(np.einsum('...ij,...j->...i', c, dobs) * eigen_vector.numpy(), axis=1))
-            rewards = rewards*0.0 + intrinsic_reward
+            rewards = rewards*0.0 + intrinsic_reward*1000
         
 
 
@@ -292,11 +292,11 @@ poetry run pip install "stable_baselines3==2.0.0a1"
             # -delta 
             observations_delta = torch.tensor(rb.observations[batch_inds_delta, batch_inds_envs]).to(device)
             next_observations_delta = torch.tensor(rb.next_observations[batch_inds_delta, batch_inds_envs]).to(device)
-
+            d_obs_delta = next_observations_delta - observations_delta
             with torch.no_grad():
-                next_state_actions, next_state_log_pi, _ = actor.get_action(next_observations)
-                qf1_next_target = qf1_target(next_observations, next_state_actions)
-                qf2_next_target = qf2_target(next_observations, next_state_actions)
+                next_state_actions, next_state_log_pi, _ = actor.get_action(next_observations, d_obs_delta)
+                qf1_next_target = qf1_target(next_observations, d_obs_delta, next_state_actions)
+                qf2_next_target = qf2_target(next_observations, d_obs_delta, next_state_actions)
                 min_qf_next_target = torch.min(qf1_next_target, qf2_next_target) - alpha * next_state_log_pi
                 # update C
                 # d_obs = next_observations - observations
@@ -312,8 +312,8 @@ poetry run pip install "stable_baselines3==2.0.0a1"
 
                 next_q_value = rewards.flatten() + (1 - dones.flatten()) * args.gamma * (min_qf_next_target).view(-1)
 
-            qf1_a_values = qf1(observations, actions).view(-1)
-            qf2_a_values = qf2(observations, actions).view(-1)
+            qf1_a_values = qf1(observations, d_obs_delta, actions).view(-1)
+            qf2_a_values = qf2(observations, d_obs_delta, actions).view(-1)
             qf1_loss = F.mse_loss(qf1_a_values, next_q_value)
             qf2_loss = F.mse_loss(qf2_a_values, next_q_value)
             qf_loss = qf1_loss + qf2_loss
@@ -327,9 +327,9 @@ poetry run pip install "stable_baselines3==2.0.0a1"
                 for _ in range(
                     args.policy_frequency
                 ):  # compensate for the delay by doing 'actor_update_interval' instead of 1
-                    pi, log_pi, _ = actor.get_action(observations)
-                    qf1_pi = qf1(observations, pi)
-                    qf2_pi = qf2(observations, pi)
+                    pi, log_pi, _ = actor.get_action(observations, d_obs_delta)
+                    qf1_pi = qf1(observations, d_obs_delta,  pi)
+                    qf2_pi = qf2(observations, d_obs_delta,  pi)
                     min_qf_pi = torch.min(qf1_pi, qf2_pi)
                     actor_loss = ((alpha * log_pi) - min_qf_pi).mean()
 
@@ -339,7 +339,7 @@ poetry run pip install "stable_baselines3==2.0.0a1"
 
                     if args.autotune:
                         with torch.no_grad():
-                            _, log_pi, _ = actor.get_action(observations)
+                            _, log_pi, _ = actor.get_action(observations, d_obs_delta)
                         alpha_loss = (-log_alpha.exp() * (log_pi + target_entropy)).mean()
 
                         a_optimizer.zero_grad()
@@ -366,21 +366,27 @@ poetry run pip install "stable_baselines3==2.0.0a1"
                 print('mean reward :',rewards.mean().item())
                 print('max intrinsic reward :',rewards.max().item())
                 print('min reward :',rewards.min().item())
-                print('C :', C)
+                # print('C :', C)
                 writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
                 if args.autotune:
                     writer.add_scalar("losses/alpha_loss", alpha_loss.item(), global_step)
         if global_step % args.freq_videos == 0 and global_step > 0:
             env_plot = gym.make(args.env_id, render_mode=None, render = True)
             frames = []
-            state, _ = env_plot.reset()
             for k in range(args.episodes_captured): 
                 print('episode played :', k)
                 state, _ = env_plot.reset()
                 d = False 
+                obs_list = []
+                next_obs_list = []
+                dobs_delta = state*0
+                dobs_delta = np.expand_dims(dobs_delta, axis=0) 
                 while not d: 
-                    a, _, _= actor.get_action(torch.Tensor(state).to(device).unsqueeze(0))
+                    dobs_delta = np.expand_dims(next_obs_list[-args.delta+1] - obs_list[-args.delta+1], axis = 0) if len(obs_list) > args.delta else dobs_delta
+                    a, _, _= actor.get_action(torch.Tensor(state).to(device).unsqueeze(0), torch.Tensor(dobs_delta).to(device))
+                    obs_list.append(state)
                     state, _, d, _ , _= env_plot.step(a[0].detach().cpu().numpy())
+                    next_obs_list.append(state)
                     frames.append(env_plot.render())
             env_plot.save_video(frames = frames, filename=f"videos/{run_name}_episode_{global_step}.mp4", fps=4)
             env_plot.close()
