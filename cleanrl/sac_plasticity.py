@@ -252,9 +252,14 @@ poetry run pip install "stable_baselines3==2.0.0a1"
         if rb.pos > args.delta:
             dobs = next_obs - obs
             dobs_delta =  rb.next_observations[rb.pos - args.delta + 1] - rb.observations[rb.pos - args.delta + 1]
-            c = np.einsum('bi,bj->bij', dobs, dobs_delta)
-            intrinsic_reward = np.abs(np.sum(np.einsum('...ij,...j->...i', c, dobs) * eigen_vector.numpy(), axis=1))
-            rewards = rewards*0.0 + intrinsic_reward*1000
+            c_step = np.einsum('bi,bj->bij', dobs, dobs_delta)
+            C = (1 - args.tau_covariance) * C + args.tau_covariance * c_step
+            intrinsic_reward = np.abs(np.sum(np.einsum('...ij,...j->...i', torch.Tensor(c_step) - C, dobs) * eigen_vector.numpy(), axis=1)) 
+                                # - torch.abs(torch.trace(torch.Tensor(c_step[0])))
+        else : 
+            intrinsic_reward = 0.0
+
+        rewards = rewards*0.0 + intrinsic_reward*1000
         
 
 
@@ -298,18 +303,6 @@ poetry run pip install "stable_baselines3==2.0.0a1"
                 qf1_next_target = qf1_target(next_observations, d_obs_delta, next_state_actions)
                 qf2_next_target = qf2_target(next_observations, d_obs_delta, next_state_actions)
                 min_qf_next_target = torch.min(qf1_next_target, qf2_next_target) - alpha * next_state_log_pi
-                # update C
-                # d_obs = next_observations - observations
-                # d_obs_delta = next_observations_delta - observations_delta
-                # d_obs = d_obs - d_obs.mean(dim=0, keepdim=True)
-                # d_obs_delta = d_obs_delta - d_obs_delta.mean(dim=0, keepdim=True)
-                # cov_d_obs = torch.einsum('bi,bj->bij', d_obs, d_obs_delta)
-                # C = (1 - args.tau_covariance) * C + args.tau_covariance * cov_d_obs.mean(dim=0)
-                # intrinsic_reward= torch.abs(torch.sum(torch.einsum('ij,bj->bi', C, d_obs) * eigen_vector, dim=1))
-                # rewards = rewards.flatten()*0.0 + intrinsic_reward*1e5
-                # C = (1 - args.tau_covariance) * C + args.tau_covariance * torch.ger(observations.flatten(), observations.flatten())
-
-
                 next_q_value = rewards.flatten() + (1 - dones.flatten()) * args.gamma * (min_qf_next_target).view(-1)
 
             qf1_a_values = qf1(observations, d_obs_delta, actions).view(-1)

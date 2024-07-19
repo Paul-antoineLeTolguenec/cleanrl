@@ -199,7 +199,7 @@ poetry run pip install "stable_baselines3==2.0.0a1"
             if global_step % args.train_frequency == 0:
                 data = rb.sample(args.batch_size)
                 with torch.no_grad():
-                    target_q_values = target_network(data.next_observations)
+                    target_q_values = target_network(data.observations)
                     target_policy = F.softmax(target_q_values / args.tau_soft, dim=-1)
                     target_next_q_values = target_network(data.next_observations)
                     target_next_policy = F.softmax(target_next_q_values / args.tau_soft, dim=-1)
