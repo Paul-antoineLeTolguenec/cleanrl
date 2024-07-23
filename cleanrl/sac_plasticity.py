@@ -253,6 +253,7 @@ poetry run pip install "stable_baselines3==2.0.0a1"
             dobs = next_obs - obs
             dobs_delta =  rb.next_observations[rb.pos - args.delta + 1] - rb.observations[rb.pos - args.delta + 1]
             c_step = np.einsum('bi,bj->bij', dobs, dobs_delta)
+            print('c_step :', c_step)
             C = (1 - args.tau_covariance) * C + args.tau_covariance * c_step
             intrinsic_reward = np.abs(np.sum(np.einsum('...ij,...j->...i', torch.Tensor(c_step) - C, dobs) * eigen_vector.numpy(), axis=1)) 
                                 # - torch.abs(torch.trace(torch.Tensor(c_step[0])))
@@ -359,6 +360,7 @@ poetry run pip install "stable_baselines3==2.0.0a1"
                 print('mean reward :',rewards.mean().item())
                 print('max intrinsic reward :',rewards.max().item())
                 print('min reward :',rewards.min().item())
+                print('Covariance :', C)
                 # print('C :', C)
                 writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
                 if args.autotune:
